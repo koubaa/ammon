@@ -4,9 +4,10 @@
 
 use ammon::gpu::create_runtime;
 use ammon::kernels::{
-    DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel, SwigluKernel, DEFAULT_ROPE_THETA,
+    DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel, SwigluKernel, TensorKernels,
+    DEFAULT_ROPE_THETA,
 };
-use goldy::{BufferKind, DepositTarget, MemoryExchange, Runtime, Scheme};
+use goldy::{BufferKind, DepositTarget, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
 fn runtime() -> Runtime {
     create_runtime().expect("goldy runtime")
@@ -188,4 +189,34 @@ fn deposit_feeds_embed_without_rerecord() {
         }
     }
     assert_eq!(worker.replay_stats().records, 1);
+}
+
+#[test]
+fn tensor_add_into_is_elementwise() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let a = Tensor::from_f32(&device, TensorShape::vector(2), &[1.0, 2.0]).unwrap();
+    let b = Tensor::from_f32(&device, TensorShape::vector(2), &[3.0, 4.0]).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::vector(2), TensorDType::F32).unwrap();
+    let mut kernels = TensorKernels::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    kernels
+        .add_into(&mut scheme, "add", a.view(), b.view(), out.view())
+        .unwrap();
+    assert_eq!(read_f32(&mut scheme, out.buffer()), vec![4.0, 6.0]);
+}
+
+#[test]
+fn tensor_matmul_into_is_gemv() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let w = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 0.0, 0.0, 1.0]).unwrap();
+    let x = Tensor::from_f32(&device, TensorShape::vector(2), &[3.0, 4.0]).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::vector(2), TensorDType::F32).unwrap();
+    let mut kernels = TensorKernels::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    kernels
+        .matmul_into(&mut scheme, "gemv", w.view(), x.view(), out.view())
+        .unwrap();
+    assert_eq!(read_f32(&mut scheme, out.buffer()), vec![3.0, 4.0]);
 }

@@ -7,6 +7,7 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 ## What it owns
 
 - GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV
+- Re-exported Goldy tensor kernels: residual `add` and semantic `matmul` (`TensorKernels`)
 - `DecodeStep { token, position }` control parcel
 - `AutoregressiveModel` / `Tokenizer` traits
 - llama2.c-compatible BPE (`BpeTokenizer`)
