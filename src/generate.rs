@@ -97,7 +97,12 @@ pub fn generate<M: AutoregressiveModel, T: Tokenizer>(
     options: GenerateOptions,
 ) -> Result<GenerateOutput> {
     let prompt_tokens = tokenizer.encode(prompt, options.bos, options.eos);
-    let out = generate_tokens(model, &prompt_tokens, options.max_new_tokens, options.stop_on)?;
+    let out = generate_tokens(
+        model,
+        &prompt_tokens,
+        options.max_new_tokens,
+        options.stop_on,
+    )?;
     let mut text = String::new();
     let mut prev = prompt_tokens[0];
     for &tok in &out.tokens {
