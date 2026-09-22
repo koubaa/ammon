@@ -16,7 +16,11 @@ pub struct DecodeStep {
 
 /// Gather one embedding row from a `[vocab, dim]` view into `x`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
-fn embed(embed: goldy::gpu::Tensor<f32>, step: &[DecodeStep], x: goldy::gpu::TensorWrite<f32>) {
+fn embed(
+    #[tensor(shape = [vocab, dim])] embed: goldy::gpu::Tensor<f32>,
+    step: &[DecodeStep],
+    #[tensor(shape = [dim])] x: goldy::gpu::TensorWrite<f32>,
+) {
     let i = goldy::gpu::global_id().x;
     if i < x.len() {
         let token = step[0].token;
@@ -24,12 +28,13 @@ fn embed(embed: goldy::gpu::Tensor<f32>, step: &[DecodeStep], x: goldy::gpu::Ten
     }
 }
 
-/// Row-major GEMV. Rank-2 `xout` is pos-strided (`[seq, width]`); rank-1 writes `xout[i]`.
+/// Position-strided KV-cache writer: `[n] × [d, n] -> [seq, d]` at `step.position`.
+/// Ordinary rank-1 GEMV stays Goldy semantic matmul.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn gemv(
-    x: goldy::gpu::Tensor<f32>,
-    w: goldy::gpu::Tensor<f32>,
-    xout: goldy::gpu::TensorWrite<f32>,
+    #[tensor(shape = [n])] x: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [d, n])] w: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [seq, d])] xout: goldy::gpu::TensorWrite<f32>,
     step: &[DecodeStep],
 ) {
     let i = goldy::gpu::global_id().x;
@@ -37,10 +42,7 @@ fn gemv(
     let d = w.dim(0);
     if i < d {
         let pos = step[0].position;
-        let mut out_i = i;
-        if xout.rank() >= 2 {
-            out_i = pos * xout.dim(1) + i;
-        }
+        let out_i = pos * xout.dim(1) + i;
         let mut sum = 0.0;
         for j in 0..n {
             sum = sum + w[i * n + j] * x[j];
@@ -52,9 +54,9 @@ fn gemv(
 /// RMSNorm into `o` (one workgroup, strided over `x.len()`).
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rmsnorm(
-    x: goldy::gpu::Tensor<f32>,
-    weight: goldy::gpu::Tensor<f32>,
-    o: goldy::gpu::TensorWrite<f32>,
+    #[tensor(shape = [dim])] x: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [dim])] weight: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [dim])] o: goldy::gpu::TensorWrite<f32>,
 ) {
     let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
     let local = goldy::gpu::local_id().x;
@@ -79,7 +81,10 @@ fn rmsnorm(
 
 /// In-place RMSNorm on `x`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
-fn rmsnorm_inplace(x: goldy::gpu::TensorMut<f32>, weight: goldy::gpu::Tensor<f32>) {
+fn rmsnorm_inplace(
+    #[tensor(shape = [dim])] x: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [dim])] weight: goldy::gpu::Tensor<f32>,
+) {
     let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
     let local = goldy::gpu::local_id().x;
     let size = x.len();
@@ -101,13 +106,12 @@ fn rmsnorm_inplace(x: goldy::gpu::TensorMut<f32>, weight: goldy::gpu::Tensor<f32
     }
 }
 
-/// Pairwise RoPE on Q and the current K cache row (`k` is `[seq, kv_dim]` or a 1D row).
+/// Pairwise RoPE on Q heads and the current K cache row.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rope(
-    q: goldy::gpu::TensorMut<f32>,
-    k: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [q_heads, head])] q: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] k: goldy::gpu::TensorMut<f32>,
     step: &[DecodeStep],
-    head_size: u32,
     theta: f32,
 ) {
     let i = goldy::gpu::global_id().x * 2;
@@ -116,10 +120,8 @@ fn rope(
         return;
     }
     let pos = step[0].position;
-    let mut kv_dim = k.len();
-    if k.rank() >= 2 {
-        kv_dim = k.dim(1);
-    }
+    let head_size = q.dim(1);
+    let kv_dim = k.dim(1) * k.dim(2);
     let k_base = pos * kv_dim;
     let head_dim = (i % head_size) as i32;
     let freq = 1.0 / goldy::gpu::pow(theta, (head_dim as f32) / (head_size as f32));
@@ -148,30 +150,24 @@ fn rope(
 /// Multi-head attention (one workgroup per head). Inclusive over `t <= pos`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn attention(
-    q: goldy::gpu::Tensor<f32>,
-    att: goldy::gpu::TensorMut<f32>,
-    xb: goldy::gpu::TensorWrite<f32>,
-    key_cache: goldy::gpu::Tensor<f32>,
-    value_cache: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, head])] q: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, seq])] att: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [q_heads, head])] xb: goldy::gpu::TensorWrite<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] key_cache: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] value_cache: goldy::gpu::Tensor<f32>,
     step: &[DecodeStep],
-    kv_mul: u32,
-    head_size: u32,
 ) {
     let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
     let h = goldy::gpu::workgroup_id().x;
     let local = goldy::gpu::local_id().x;
     let pos = step[0].position;
-    let q_base = h * head_size;
-    let mut seq_len = att.len();
-    if att.rank() >= 2 {
-        seq_len = att.dim(1);
-    }
+    let head_size = q.dim(1);
+    let seq_len = att.dim(1);
     let att_base = h * seq_len;
+    let q_base = h * head_size;
+    let kv_mul = q.dim(0) / key_cache.dim(1);
     let kv_head = h / kv_mul;
-    let mut kv_dim = key_cache.len();
-    if key_cache.rank() >= 2 {
-        kv_dim = key_cache.dim(1);
-    }
+    let kv_dim = key_cache.dim(1) * key_cache.dim(2);
 
     let mut t = local;
     while t <= pos {
@@ -200,7 +196,10 @@ fn attention(
 
 /// SwiGLU: `hb[i] *= silu(hb[i]) * hb2[i]`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
-fn swiglu(hb: goldy::gpu::TensorMut<f32>, hb2: goldy::gpu::Tensor<f32>) {
+fn swiglu(
+    #[tensor(shape = [hidden])] hb: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [hidden])] hb2: goldy::gpu::Tensor<f32>,
+) {
     let i = goldy::gpu::global_id().x;
     if i >= hb.len() {
         return;

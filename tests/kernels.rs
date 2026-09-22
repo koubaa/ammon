@@ -21,16 +21,16 @@ fn step_buf(device: &Runtime, token: u32, position: u32) -> goldy::Buffer {
         .unwrap()
 }
 
+fn expect_record_err<T>(r: Result<T, goldy::GoldyError>) -> goldy::GoldyError {
+    match r {
+        Err(e) => e,
+        Ok(_) => panic!("expected tensor shape contract error"),
+    }
+}
+
 fn read_f32(scheme: &mut Scheme, buf: &goldy::Buffer) -> Vec<f32> {
-    let grant = MemoryExchange::new(scheme.context())
-        .bind_withdraw(scheme, buf)
-        .expect("withdraw");
     let mut sub = scheme.submit().expect("submit");
-    let bytes = grant
-        .claim(&mut sub)
-        .expect("claim")
-        .consume()
-        .expect("consume");
+    let bytes = (&mut sub >> buf).take::<u8>().expect("host take");
     bytemuck::cast_slice(&bytes).to_vec()
 }
 
@@ -56,10 +56,10 @@ fn embed_gathers_selected_row() {
 fn rope_at_pos_zero_is_identity() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let q = Tensor::from_f32(&device, TensorShape::vector(4), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let q = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let k = Tensor::from_f32(
         &device,
-        TensorShape::from_dims(&[1, 4]).unwrap(),
+        TensorShape::from_dims(&[1, 2, 2]).unwrap(),
         &[5.0, 6.0, 7.0, 8.0],
     )
     .unwrap();
@@ -67,15 +67,7 @@ fn rope_at_pos_zero_is_identity() {
     let kernel = RopeKernel::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
     kernel
-        .record(
-            &mut scheme,
-            "rope",
-            q.view(),
-            k.view(),
-            &step,
-            2,
-            DEFAULT_ROPE_THETA,
-        )
+        .record(&mut scheme, "rope", q.view(), k.view(), &step, DEFAULT_ROPE_THETA)
         .unwrap()
         .over_1d(2);
     let q_out = read_f32(&mut scheme, q.buffer());
@@ -88,7 +80,7 @@ fn gemv_identity() {
     let ctx = device.create_context().unwrap();
     let x = Tensor::from_f32(&device, TensorShape::vector(2), &[1.0, 2.0]).unwrap();
     let w = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 0.0, 0.0, 1.0]).unwrap();
-    let out = Tensor::from_f32(&device, TensorShape::vector(2), &[0.0, 0.0]).unwrap();
+    let out = Tensor::from_f32(&device, TensorShape::matrix(1, 2), &[0.0, 0.0]).unwrap();
     let step = step_buf(&device, 0, 0);
     let gemv = GemvKernel::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
@@ -96,6 +88,48 @@ fn gemv_identity() {
         .unwrap()
         .over_1d(2);
     assert_eq!(read_f32(&mut scheme, out.buffer()), vec![1.0, 2.0]);
+}
+
+#[test]
+fn gemv_writes_cache_row_at_position() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let x = Tensor::from_f32(&device, TensorShape::vector(2), &[1.0, 2.0]).unwrap();
+    let w = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 0.0, 0.0, 1.0]).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::matrix(4, 2), TensorDType::F32).unwrap();
+    let step = step_buf(&device, 0, 2);
+    let gemv = GemvKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    gemv.record(&mut scheme, "gemv_pos", x.view(), w.view(), out.view(), &step)
+        .unwrap()
+        .over_1d(2);
+    assert_eq!(
+        read_f32(&mut scheme, out.buffer()),
+        vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn gemv_rejects_rank1_output() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let x = Tensor::from_f32(&device, TensorShape::vector(2), &[1.0, 2.0]).unwrap();
+    let w = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 0.0, 0.0, 1.0]).unwrap();
+    let out = Tensor::from_f32(&device, TensorShape::vector(2), &[0.0, 0.0]).unwrap();
+    let step = step_buf(&device, 0, 0);
+    let gemv = GemvKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    let before = scheme.ir_node_count();
+    let err = expect_record_err(gemv.record(
+        &mut scheme,
+        "gemv_rank1",
+        x.view(),
+        w.view(),
+        out.view(),
+        &step,
+    ));
+    assert!(err.to_string().contains("expected rank 2"), "{err}");
+    assert_eq!(scheme.ir_node_count(), before);
 }
 
 #[test]
@@ -152,9 +186,6 @@ fn deposit_feeds_embed_without_rerecord() {
         .record(&mut worker, "embed", embed.view(), &step, x.view())
         .unwrap()
         .over_1d(2);
-    let grant = MemoryExchange::new(&ctx)
-        .bind_withdraw(&mut worker, x.buffer())
-        .unwrap();
     let mut upload = Scheme::new(&ctx);
     let deposit = MemoryExchange::new(&ctx)
         .bind_deposit(
@@ -168,8 +199,7 @@ fn deposit_feeds_embed_without_rerecord() {
             .unwrap();
         let _ = upload.submit().unwrap();
         let mut sub = worker.submit().unwrap();
-        let bytes = grant.claim(&mut sub).unwrap().consume().unwrap();
-        let got: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        let got = (&mut sub >> x.buffer()).take::<f32>().unwrap().to_vec();
         if token == 0 {
             assert_eq!(got, vec![10.0, 20.0]);
         } else {
@@ -207,4 +237,49 @@ fn tensor_matmul_into_is_gemv() {
         .matmul_into(&mut scheme, "gemv", w.view(), x.view(), out.view())
         .unwrap();
     assert_eq!(read_f32(&mut scheme, out.buffer()), vec![3.0, 4.0]);
+}
+
+#[test]
+fn rope_rejects_rank2_kv_cache() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let q = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let k = Tensor::from_f32(&device, TensorShape::matrix(1, 4), &[5.0, 6.0, 7.0, 8.0]).unwrap();
+    let step = step_buf(&device, 0, 0);
+    let kernel = RopeKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    let before = scheme.ir_node_count();
+    let err = expect_record_err(kernel.record(
+        &mut scheme,
+        "rope_rank",
+        q.view(),
+        k.view(),
+        &step,
+        DEFAULT_ROPE_THETA,
+    ));
+    assert!(err.to_string().contains("parameter `k`"), "{err}");
+    assert!(err.to_string().contains("expected rank 3"), "{err}");
+    assert_eq!(scheme.ir_node_count(), before);
+}
+
+#[test]
+fn embed_rejects_dim_mismatch() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let embed = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let step = step_buf(&device, 1, 0);
+    let x = Tensor::from_f32(&device, TensorShape::vector(3), &[0.0, 0.0, 0.0]).unwrap();
+    let kernel = EmbedKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    let before = scheme.ir_node_count();
+    let err = expect_record_err(kernel.record(
+        &mut scheme,
+        "embed_dim",
+        embed.view(),
+        &step,
+        x.view(),
+    ));
+    assert!(err.to_string().contains("parameter `x`"), "{err}");
+    assert!(err.to_string().contains("`dim`"), "{err}");
+    assert_eq!(scheme.ir_node_count(), before);
 }
