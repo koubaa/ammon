@@ -11,8 +11,7 @@ use crate::kernels::{
 use anyhow::{Context, Result};
 use goldy::{Buffer, Scheme, TensorView};
 
-/// Prepared kernels for one runtime. Keep this alive as long as schemes recorded
-/// from it are submitted; include copies pipeline handles, not the kernel objects.
+/// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
 pub struct Blocks {
     embed: EmbedKernel,
     rmsnorm: RmsnormKernel,
@@ -70,7 +69,7 @@ impl Blocks {
 
     /// Token-row gather into `x`.
     pub fn record_embed(
-        &mut self,
+        &self,
         scheme: &mut Scheme,
         table: TensorView<'_>,
         step: &Buffer,
@@ -88,7 +87,7 @@ impl Blocks {
     /// sees that storage as `[seq, kv_dim]`; RoPE and attention keep the head view.
     /// `q` and `att` are packed vectors, reshaped from the key-cache head size.
     pub fn record_attention(
-        &mut self,
+        &self,
         scheme: &mut Scheme,
         sites: AttentionSites<'_>,
     ) -> Result<()> {
@@ -153,7 +152,7 @@ impl Blocks {
     }
 
     /// RMSNorm, SwiGLU, down projection, residual into `x`.
-    pub fn record_ffn(&mut self, scheme: &mut Scheme, sites: FfnSites<'_>) -> Result<()> {
+    pub fn record_ffn(&self, scheme: &mut Scheme, sites: FfnSites<'_>) -> Result<()> {
         self.rmsnorm
             .record(scheme, "rmsnorm", sites.x, sites.rms, sites.xb)?
             .groups([1, 1, 1]);
@@ -173,7 +172,7 @@ impl Blocks {
 
     /// Final RMSNorm and classifier GEMV into `logits`.
     pub fn record_logits(
-        &mut self,
+        &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
         rms_final: TensorView<'_>,

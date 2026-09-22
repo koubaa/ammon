@@ -220,22 +220,22 @@ pub use swiglu::Kernel as SwigluKernel;
 
 /// Goldy tensor add / semantic matmul, prepared once per runtime.
 ///
-/// Architecture crates record through this instead of [`goldy::TensorContext`].
+/// Architecture crates record through this instead of [`goldy::TensorKernels`].
 /// Residuals use Goldy's portable binary kernel; packed GEMV/GEMM uses Goldy's
 /// semantic matmul (cuBLAS / MPS / stdlib).
 pub struct TensorKernels {
-    ctx: goldy::TensorContext,
+    ops: goldy::TensorKernels,
 }
 
 impl TensorKernels {
     pub fn prepare(runtime: &goldy::Runtime) -> anyhow::Result<Self> {
         Ok(Self {
-            ctx: goldy::TensorContext::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?,
+            ops: goldy::TensorKernels::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?,
         })
     }
 
     pub fn add_into(
-        &mut self,
+        &self,
         scheme: &mut goldy::Scheme,
         label: impl Into<String>,
         a: goldy::TensorView<'_>,
@@ -243,14 +243,14 @@ impl TensorKernels {
         out: goldy::TensorView<'_>,
     ) -> anyhow::Result<()> {
         let label = label.into();
-        self.ctx
+        self.ops
             .recorder(scheme)
             .add_into(&label, a, b, out)
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     pub fn matmul_into(
-        &mut self,
+        &self,
         scheme: &mut goldy::Scheme,
         label: impl Into<String>,
         a: goldy::TensorView<'_>,
@@ -258,7 +258,7 @@ impl TensorKernels {
         out: goldy::TensorView<'_>,
     ) -> anyhow::Result<()> {
         let label = label.into();
-        self.ctx
+        self.ops
             .recorder(scheme)
             .matmul_into(&label, a, b, out)
             .map_err(|e| anyhow::anyhow!("{e}"))
