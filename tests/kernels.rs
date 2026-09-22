@@ -67,7 +67,14 @@ fn rope_at_pos_zero_is_identity() {
     let kernel = RopeKernel::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
     kernel
-        .record(&mut scheme, "rope", q.view(), k.view(), &step, DEFAULT_ROPE_THETA)
+        .record(
+            &mut scheme,
+            "rope",
+            q.view(),
+            k.view(),
+            &step,
+            DEFAULT_ROPE_THETA,
+        )
         .unwrap()
         .over_1d(2);
     let q_out = read_f32(&mut scheme, q.buffer());
@@ -100,9 +107,16 @@ fn gemv_writes_cache_row_at_position() {
     let step = step_buf(&device, 0, 2);
     let gemv = GemvKernel::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
-    gemv.record(&mut scheme, "gemv_pos", x.view(), w.view(), out.view(), &step)
-        .unwrap()
-        .over_1d(2);
+    gemv.record(
+        &mut scheme,
+        "gemv_pos",
+        x.view(),
+        w.view(),
+        out.view(),
+        &step,
+    )
+    .unwrap()
+    .over_1d(2);
     assert_eq!(
         read_f32(&mut scheme, out.buffer()),
         vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0]
@@ -266,19 +280,15 @@ fn rope_rejects_rank2_kv_cache() {
 fn embed_rejects_dim_mismatch() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let embed = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let embed =
+        Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let step = step_buf(&device, 1, 0);
     let x = Tensor::from_f32(&device, TensorShape::vector(3), &[0.0, 0.0, 0.0]).unwrap();
     let kernel = EmbedKernel::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
     let before = scheme.ir_node_count();
-    let err = expect_record_err(kernel.record(
-        &mut scheme,
-        "embed_dim",
-        embed.view(),
-        &step,
-        x.view(),
-    ));
+    let err =
+        expect_record_err(kernel.record(&mut scheme, "embed_dim", embed.view(), &step, x.view()));
     assert!(err.to_string().contains("parameter `x`"), "{err}");
     assert!(err.to_string().contains("`dim`"), "{err}");
     assert_eq!(scheme.ir_node_count(), before);
