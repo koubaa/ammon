@@ -7,8 +7,8 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 ## What it owns
 
 - GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV
-- Recordable modules that own decode scratch where needed (`CausalSelfAttention`, `SwiGluMlp`, `KvCache`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`)
-- Weight view structs (`AttentionWeights`, `SwiGluWeights`); packed checkpoints stay in architecture crates
+- Recordable modules that own decode scratch where needed (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`)
+- Weight view structs (`CausalAttentionBlockWeights`, `SwiGluBlockWeights`); packed checkpoints stay in architecture crates
 - Prepared kernels cached per Goldy runtime (not part of the architecture-crate API)
 - Re-exported Goldy tensor kernels: residual `add` and semantic `matmul` (`TensorKernels`)
 - `DecodeStep { token, position }` control parcel (`DecodeStep::parcel`, `DecodeStep::deposit_target`)

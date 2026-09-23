@@ -8,9 +8,9 @@ use goldy::{
 };
 use std::sync::Arc;
 
-/// Attention projection and pre-norm weights. Scratch stays on [`CausalSelfAttention`].
+/// Pre-norm causal attention block weights. Scratch stays on [`CausalAttentionBlock`].
 #[derive(Clone, Copy)]
-pub struct AttentionWeights<'a> {
+pub struct CausalAttentionBlockWeights<'a> {
     pub norm: TensorView<'a>,
     pub query: TensorView<'a>,
     pub key: TensorView<'a>,
@@ -18,9 +18,9 @@ pub struct AttentionWeights<'a> {
     pub output: TensorView<'a>,
 }
 
-/// SwiGLU feed-forward weights. Scratch stays on [`SwiGluMlp`].
+/// Pre-norm SwiGLU block weights. Scratch stays on [`SwiGluBlock`].
 #[derive(Clone, Copy)]
-pub struct SwiGluWeights<'a> {
+pub struct SwiGluBlockWeights<'a> {
     pub norm: TensorView<'a>,
     pub gate: TensorView<'a>,
     pub up: TensorView<'a>,
@@ -164,8 +164,10 @@ impl Linear {
     }
 }
 
-/// Causal multi-head attention with owned decode scratch (`xb`, `xb2`, `q`, `att`).
-pub struct CausalSelfAttention {
+/// Pre-norm causal attention block: RMSNorm, QKV, RoPE, attention, projection, residual.
+///
+/// Owns decode scratch (`xb`, `xb2`, `q`, `att`).
+pub struct CausalAttentionBlock {
     blocks: Arc<Blocks>,
     xb: Tensor,
     xb2: Tensor,
@@ -173,7 +175,7 @@ pub struct CausalSelfAttention {
     att: Tensor,
 }
 
-impl CausalSelfAttention {
+impl CausalAttentionBlock {
     pub fn new(
         runtime: &Runtime,
         hidden: u32,
@@ -205,7 +207,7 @@ impl CausalSelfAttention {
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
-        weights: AttentionWeights<'_>,
+        weights: CausalAttentionBlockWeights<'_>,
         cache: KvLayer<'_>,
         step: &Buffer,
     ) -> Result<(), GoldyError> {
@@ -234,7 +236,7 @@ impl CausalSelfAttention {
         worker: &mut Scheme,
         label: impl Into<SchemeLabel>,
         x: TensorView<'_>,
-        weights: AttentionWeights<'_>,
+        weights: CausalAttentionBlockWeights<'_>,
         cache: KvLayer<'_>,
         step: &Buffer,
     ) -> Result<(), GoldyError> {
@@ -243,15 +245,17 @@ impl CausalSelfAttention {
     }
 }
 
-/// Pre-norm SwiGLU MLP with owned decode scratch (`xb`, `hb`, `hb2`).
-pub struct SwiGluMlp {
+/// Pre-norm SwiGLU block: RMSNorm, gated MLP, residual.
+///
+/// Owns decode scratch (`xb`, `hb`, `hb2`).
+pub struct SwiGluBlock {
     blocks: Arc<Blocks>,
     xb: Tensor,
     hb: Tensor,
     hb2: Tensor,
 }
 
-impl SwiGluMlp {
+impl SwiGluBlock {
     pub fn new(runtime: &Runtime, hidden: u32, intermediate: u32) -> anyhow::Result<Self> {
         Ok(Self {
             blocks: blocks(runtime)?,
@@ -265,7 +269,7 @@ impl SwiGluMlp {
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
-        weights: SwiGluWeights<'_>,
+        weights: SwiGluBlockWeights<'_>,
     ) -> Result<(), GoldyError> {
         self.blocks.record_ffn(
             scheme,
@@ -287,7 +291,7 @@ impl SwiGluMlp {
         worker: &mut Scheme,
         label: impl Into<SchemeLabel>,
         x: TensorView<'_>,
-        weights: SwiGluWeights<'_>,
+        weights: SwiGluBlockWeights<'_>,
     ) -> Result<(), GoldyError> {
         worker.group(label, |scheme| self.record(scheme, x, weights))?;
         Ok(())

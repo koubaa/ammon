@@ -15,8 +15,8 @@ pub mod modules;
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use modules::{
-    AttentionWeights, CausalSelfAttention, Embedding, KvCache, KvLayer, Linear, RmsNorm, SwiGluMlp,
-    SwiGluWeights,
+    CausalAttentionBlock, CausalAttentionBlockWeights, Embedding, KvCache, KvLayer, Linear,
+    RmsNorm, SwiGluBlock, SwiGluBlockWeights,
 };
 
 pub use generate::{
