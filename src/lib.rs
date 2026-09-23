@@ -10,9 +10,15 @@ pub mod blocks;
 pub mod gpu;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod kernels;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod modules;
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub use blocks::{AttentionSites, Blocks, FfnSites};
+pub use blocks::Blocks;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use modules::{
+    AttentionWeights, CausalSelfAttention, KvCache, KvLayer, SwiGluMlp, SwiGluWeights,
+};
 
 pub use generate::{
     generate, generate_tokens, GenerateOptions, GenerateOutput, GenerateTokenOutput,

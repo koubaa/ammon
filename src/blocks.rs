@@ -8,7 +8,7 @@ use crate::kernels::{
     SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
 };
 use anyhow::Context;
-use goldy::{Buffer, GoldyError, Scheme, TensorView};
+use goldy::{Buffer, GoldyError, Scheme, SchemeLabel, TensorView};
 
 /// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
 pub struct Blocks {
@@ -23,7 +23,7 @@ pub struct Blocks {
 }
 
 /// Activation and weight views for one attention block.
-pub struct AttentionSites<'a> {
+pub(crate) struct AttentionSites<'a> {
     pub x: TensorView<'a>,
     pub xb: TensorView<'a>,
     pub xb2: TensorView<'a>,
@@ -40,7 +40,7 @@ pub struct AttentionSites<'a> {
 }
 
 /// Activation and weight views for one SwiGLU feed-forward block.
-pub struct FfnSites<'a> {
+pub(crate) struct FfnSites<'a> {
     pub x: TensorView<'a>,
     pub xb: TensorView<'a>,
     pub hb: TensorView<'a>,
@@ -80,13 +80,25 @@ impl Blocks {
         Ok(())
     }
 
+    pub fn record_embed_group(
+        &self,
+        worker: &mut Scheme,
+        label: impl Into<SchemeLabel>,
+        table: TensorView<'_>,
+        step: &Buffer,
+        x: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        worker.group(label, |scheme| self.record_embed(scheme, table, step, x))?;
+        Ok(())
+    }
+
     /// RMSNorm, Q/K/V, RoPE, attention, output projection, residual into `x`.
     ///
     /// `key` and `value` are one layer, `[seq, kv_heads, head]`. The cache GEMV
     /// sees that storage as `[seq, kv_dim]`; RoPE and attention keep the head view.
     /// `q` is `[q_heads, head]` and `att` is `[q_heads, seq]`; only the projection
     /// destination and cache-writer views are flattened for GEMV.
-    pub fn record_attention(
+    pub(crate) fn record_attention(
         &self,
         scheme: &mut Scheme,
         sites: AttentionSites<'_>,
@@ -135,7 +147,11 @@ impl Blocks {
     }
 
     /// RMSNorm, SwiGLU, down projection, residual into `x`.
-    pub fn record_ffn(&self, scheme: &mut Scheme, sites: FfnSites<'_>) -> Result<(), GoldyError> {
+    pub(crate) fn record_ffn(
+        &self,
+        scheme: &mut Scheme,
+        sites: FfnSites<'_>,
+    ) -> Result<(), GoldyError> {
         self.rmsnorm
             .record(scheme, "rmsnorm", sites.x, sites.rms, sites.xb)?
             .groups([1, 1, 1]);
@@ -167,6 +183,21 @@ impl Blocks {
             .groups([1, 1, 1]);
         self.tensors
             .matmul_into(scheme, "classifier", classifier, x, logits)?;
+        Ok(())
+    }
+
+    pub fn record_logits_group(
+        &self,
+        worker: &mut Scheme,
+        label: impl Into<SchemeLabel>,
+        x: TensorView<'_>,
+        rms_final: TensorView<'_>,
+        classifier: TensorView<'_>,
+        logits: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        worker.group(label, |scheme| {
+            self.record_logits(scheme, x, rms_final, classifier, logits)
+        })?;
         Ok(())
     }
 }
