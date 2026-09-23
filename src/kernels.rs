@@ -228,9 +228,9 @@ pub struct TensorKernels {
 }
 
 impl TensorKernels {
-    pub fn prepare(runtime: &goldy::Runtime) -> anyhow::Result<Self> {
+    pub fn prepare(runtime: &goldy::Runtime) -> Result<Self, goldy::GoldyError> {
         Ok(Self {
-            ops: goldy::TensorKernels::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?,
+            ops: goldy::TensorKernels::new(runtime)?,
         })
     }
 
@@ -241,12 +241,9 @@ impl TensorKernels {
         a: goldy::TensorView<'_>,
         b: goldy::TensorView<'_>,
         out: goldy::TensorView<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), goldy::GoldyError> {
         let label = label.into();
-        self.ops
-            .recorder(scheme)
-            .add_into(&label, a, b, out)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        self.ops.recorder(scheme).add_into(&label, a, b, out)
     }
 
     pub fn matmul_into(
@@ -256,11 +253,8 @@ impl TensorKernels {
         a: goldy::TensorView<'_>,
         b: goldy::TensorView<'_>,
         out: goldy::TensorView<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), goldy::GoldyError> {
         let label = label.into();
-        self.ops
-            .recorder(scheme)
-            .matmul_into(&label, a, b, out)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        self.ops.recorder(scheme).matmul_into(&label, a, b, out)
     }
 }

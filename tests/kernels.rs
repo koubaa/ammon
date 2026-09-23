@@ -230,7 +230,7 @@ fn tensor_add_into_is_elementwise() {
     let a = Tensor::from_f32(&device, TensorShape::vector(2), &[1.0, 2.0]).unwrap();
     let b = Tensor::from_f32(&device, TensorShape::vector(2), &[3.0, 4.0]).unwrap();
     let out = Tensor::zeros(&device, TensorShape::vector(2), TensorDType::F32).unwrap();
-    let mut kernels = TensorKernels::prepare(&device).unwrap();
+    let kernels = TensorKernels::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
     kernels
         .add_into(&mut scheme, "add", a.view(), b.view(), out.view())
@@ -245,7 +245,7 @@ fn tensor_matmul_into_is_gemv() {
     let w = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 0.0, 0.0, 1.0]).unwrap();
     let x = Tensor::from_f32(&device, TensorShape::vector(2), &[3.0, 4.0]).unwrap();
     let out = Tensor::zeros(&device, TensorShape::vector(2), TensorDType::F32).unwrap();
-    let mut kernels = TensorKernels::prepare(&device).unwrap();
+    let kernels = TensorKernels::prepare(&device).unwrap();
     let mut scheme = Scheme::new(&ctx);
     kernels
         .matmul_into(&mut scheme, "gemv", w.view(), x.view(), out.view())

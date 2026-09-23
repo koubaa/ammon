@@ -1,15 +1,14 @@
 //! Decoder blocks recorded as includable schemes.
 //!
-//! Each function writes dispatches into a child [`goldy::Scheme`]. The architecture
-//! crate [`Scheme::include`]s that child into the worker. Exchanges stay on the root:
-//! these schemes only bind retained parcels.
+//! Each function writes dispatches into a grouped child [`goldy::Scheme`]. Exchanges
+//! stay on the submitting root; these blocks only bind retained parcels.
 
 use crate::kernels::{
     AttentionKernel, EmbedKernel, GemvKernel, RmsnormInplaceKernel, RmsnormKernel, RopeKernel,
     SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
 };
-use anyhow::{Context, Result};
-use goldy::{Buffer, Scheme, TensorView};
+use anyhow::Context;
+use goldy::{Buffer, GoldyError, Scheme, TensorView};
 
 /// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
 pub struct Blocks {
@@ -53,7 +52,7 @@ pub struct FfnSites<'a> {
 }
 
 impl Blocks {
-    pub fn prepare(runtime: &goldy::Runtime) -> Result<Self> {
+    pub fn prepare(runtime: &goldy::Runtime) -> anyhow::Result<Self> {
         Ok(Self {
             embed: EmbedKernel::prepare(runtime).context("prepare embed kernel")?,
             rmsnorm: RmsnormKernel::prepare(runtime).context("prepare rmsnorm kernel")?,
@@ -74,7 +73,7 @@ impl Blocks {
         table: TensorView<'_>,
         step: &Buffer,
         x: TensorView<'_>,
-    ) -> Result<()> {
+    ) -> Result<(), GoldyError> {
         self.embed
             .record(scheme, "embed", table, step, x)?
             .over_tensor(&x);
@@ -85,36 +84,20 @@ impl Blocks {
     ///
     /// `key` and `value` are one layer, `[seq, kv_heads, head]`. The cache GEMV
     /// sees that storage as `[seq, kv_dim]`; RoPE and attention keep the head view.
-    /// `q` and `att` are packed vectors, reshaped from the key-cache head size.
+    /// `q` is `[q_heads, head]` and `att` is `[q_heads, seq]`; only the projection
+    /// destination and cache-writer views are flattened for GEMV.
     pub fn record_attention(
         &self,
         scheme: &mut Scheme,
         sites: AttentionSites<'_>,
-    ) -> Result<()> {
-        let head = sites
-            .key
-            .shape()
-            .dim(2)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let seq_len = sites
-            .key
-            .shape()
-            .dim(0)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let q = as_heads(sites.q, head)?;
-        let xb_heads = as_heads(sites.xb, head)?;
-        let att = as_heads(sites.att, seq_len)?;
-        let kv_width = sites
-            .wk
-            .shape()
-            .dim(0)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let wv_rows = sites
-            .wv
-            .shape()
-            .dim(0)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let n_q_heads = q.shape().dim(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+    ) -> Result<(), GoldyError> {
+        let head = sites.key.shape().dim(2)?;
+        let q_heads = sites.q.shape().dim(0)?;
+        let q = sites.q;
+        let q_flat = q.reshape(&[q.numel_u32()])?;
+        let xb_heads = sites.xb.reshape(&[q_heads, head])?;
+        let kv_width = sites.wk.shape().dim(0)?;
+        let wv_rows = sites.wv.shape().dim(0)?;
         let key_rows = cache_rows(sites.key)?;
         let value_rows = cache_rows(sites.value)?;
 
@@ -122,7 +105,7 @@ impl Blocks {
             .record(scheme, "rmsnorm", sites.x, sites.rms, sites.xb)?
             .groups([1, 1, 1]);
         self.tensors
-            .matmul_into(scheme, "wq", sites.wq, sites.xb, sites.q)?;
+            .matmul_into(scheme, "wq", sites.wq, sites.xb, q_flat)?;
         self.gemv
             .record(scheme, "wk", sites.xb, sites.wk, key_rows, sites.step)?
             .over_1d(kv_width);
@@ -137,13 +120,13 @@ impl Blocks {
                 scheme,
                 "attn",
                 q,
-                att,
+                sites.att,
                 xb_heads,
                 sites.key,
                 sites.value,
                 sites.step,
             )?
-            .groups([n_q_heads, 1, 1]);
+            .groups([q_heads, 1, 1]);
         self.tensors
             .matmul_into(scheme, "wo", sites.wo, sites.xb, sites.xb2)?;
         self.tensors
@@ -152,7 +135,7 @@ impl Blocks {
     }
 
     /// RMSNorm, SwiGLU, down projection, residual into `x`.
-    pub fn record_ffn(&self, scheme: &mut Scheme, sites: FfnSites<'_>) -> Result<()> {
+    pub fn record_ffn(&self, scheme: &mut Scheme, sites: FfnSites<'_>) -> Result<(), GoldyError> {
         self.rmsnorm
             .record(scheme, "rmsnorm", sites.x, sites.rms, sites.xb)?
             .groups([1, 1, 1]);
@@ -178,7 +161,7 @@ impl Blocks {
         rms_final: TensorView<'_>,
         classifier: TensorView<'_>,
         logits: TensorView<'_>,
-    ) -> Result<()> {
+    ) -> Result<(), GoldyError> {
         self.rmsnorm_inplace
             .record(scheme, "rmsnorm", x, rms_final)?
             .groups([1, 1, 1]);
@@ -189,18 +172,8 @@ impl Blocks {
 }
 
 /// `[seq, kv_heads, head]` packed as the GEMV destination `[seq, kv_dim]`.
-fn cache_rows(cache: TensorView<'_>) -> Result<TensorView<'_>> {
-    let seq = cache.shape().dim(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+fn cache_rows(cache: TensorView<'_>) -> Result<TensorView<'_>, GoldyError> {
+    let seq = cache.shape().dim(0)?;
     let kv_dim = cache.numel_u32() / seq;
-    cache
-        .reshape(&[seq, kv_dim])
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-fn as_heads(packed: TensorView<'_>, inner: u32) -> Result<TensorView<'_>> {
-    anyhow::ensure!(inner > 0, "head or sequence extent must be non-zero");
-    let n = packed.numel_u32() / inner;
-    packed
-        .reshape(&[n, inner])
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    cache.reshape(&[seq, kv_dim])
 }
