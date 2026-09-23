@@ -14,6 +14,24 @@ pub struct DecodeStep {
     pub position: u32,
 }
 
+impl DecodeStep {
+    /// Retained scattered parcel for a worker deposit. Contents are overwritten each step.
+    pub fn parcel(runtime: &goldy::Runtime) -> anyhow::Result<goldy::Buffer> {
+        Ok(runtime.acquire_buffer_with_data(
+            &[Self {
+                token: 0,
+                position: 0,
+            }],
+            goldy::BufferKind::Scattered,
+        )?)
+    }
+
+    /// Deposit target covering one [`DecodeStep`] in `buffer`.
+    pub fn deposit_target(buffer: &goldy::Buffer) -> goldy::DepositTarget<'_> {
+        goldy::DepositTarget::buffer_elements::<Self>(buffer, 1)
+    }
+}
+
 /// Gather one embedding row from a `[vocab, dim]` view into `x`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn embed(

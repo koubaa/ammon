@@ -11,7 +11,7 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 - Weight view structs (`AttentionWeights`, `SwiGluWeights`); packed checkpoints stay in architecture crates
 - `Blocks` for embed / logits recording (`record_*_group` writes named child schemes)
 - Re-exported Goldy tensor kernels: residual `add` and semantic `matmul` (`TensorKernels`)
-- `DecodeStep { token, position }` control parcel
+- `DecodeStep { token, position }` control parcel (`DecodeStep::parcel`, `DecodeStep::deposit_target`)
 - `AutoregressiveModel` / `Tokenizer` traits
 - llama2.c-compatible BPE (`BpeTokenizer`)
 - Greedy `generate_tokens` / `generate`

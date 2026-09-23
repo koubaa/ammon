@@ -7,9 +7,7 @@ use ammon::kernels::{
     DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel, SwigluKernel, TensorKernels,
     DEFAULT_ROPE_THETA,
 };
-use goldy::{
-    BufferKind, DepositTarget, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape,
-};
+use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
 fn runtime() -> Runtime {
     create_runtime().expect("goldy runtime")
@@ -202,10 +200,7 @@ fn deposit_feeds_embed_without_rerecord() {
         .over_1d(2);
     let mut upload = Scheme::new(&ctx);
     let deposit = MemoryExchange::new(&ctx)
-        .bind_deposit(
-            &mut upload,
-            DepositTarget::buffer_elements::<DecodeStep>(&step, 1),
-        )
+        .bind_deposit(&mut upload, DecodeStep::deposit_target(&step))
         .unwrap();
     for token in [0u32, 1u32] {
         deposit
