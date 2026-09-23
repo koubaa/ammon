@@ -55,10 +55,7 @@ impl KvCache {
         })
     }
 
-    pub fn layer(&self, layer: usize) -> Result<KvLayer<'_>, GoldyError> {
-        let layer = u32::try_from(layer).map_err(|_| {
-            GoldyError::Validation(format!("kv cache layer {layer} does not fit in u32"))
-        })?;
+    pub fn layer(&self, layer: u32) -> Result<KvLayer<'_>, GoldyError> {
         Ok(KvLayer {
             key: squeeze_layer(self.key.view(), layer)?,
             value: squeeze_layer(self.value.view(), layer)?,
@@ -71,6 +68,100 @@ fn squeeze_layer(cache: TensorView<'_>, layer: u32) -> Result<TensorView<'_>, Go
     let kv_heads = cache.shape().dim(2)?;
     let head = cache.shape().dim(3)?;
     cache.narrow(0, layer, 1)?.reshape(&[seq, kv_heads, head])
+}
+
+fn blocks(runtime: &Runtime) -> anyhow::Result<Arc<Blocks>> {
+    Blocks::shared(runtime)
+}
+
+/// Token embedding table gather. No decode scratch.
+pub struct Embedding {
+    blocks: Arc<Blocks>,
+}
+
+impl Embedding {
+    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+        })
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        table: TensorView<'_>,
+        step: &Buffer,
+        x: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks.record_embed(scheme, table, step, x)
+    }
+
+    pub fn record_group(
+        &self,
+        worker: &mut Scheme,
+        label: impl Into<SchemeLabel>,
+        table: TensorView<'_>,
+        step: &Buffer,
+        x: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        worker.group(label, |scheme| self.record(scheme, table, step, x))?;
+        Ok(())
+    }
+}
+
+/// RMSNorm. Out-of-place writes `out`; [`Self::record_inplace`] overwrites `x`.
+pub struct RmsNorm {
+    blocks: Arc<Blocks>,
+}
+
+impl RmsNorm {
+    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+        })
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks.record_rmsnorm(scheme, x, weight, out)
+    }
+
+    pub fn record_inplace(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks.record_rmsnorm_inplace(scheme, x, weight)
+    }
+}
+
+/// Dense projection: `out = weight @ x`.
+pub struct Linear {
+    blocks: Arc<Blocks>,
+}
+
+impl Linear {
+    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+        })
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        weight: TensorView<'_>,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks.record_linear(scheme, "linear", weight, x, out)
+    }
 }
 
 /// Causal multi-head attention with owned decode scratch (`xb`, `xb2`, `q`, `att`).
@@ -89,28 +180,12 @@ impl CausalSelfAttention {
         query_heads: u32,
         seq_len: u32,
     ) -> anyhow::Result<Self> {
-        Self::with_blocks(
-            runtime,
-            Arc::new(Blocks::prepare(runtime)?),
-            hidden,
-            query_heads,
-            seq_len,
-        )
-    }
-
-    pub fn with_blocks(
-        runtime: &Runtime,
-        blocks: Arc<Blocks>,
-        hidden: u32,
-        query_heads: u32,
-        seq_len: u32,
-    ) -> anyhow::Result<Self> {
         if query_heads == 0 || hidden % query_heads != 0 {
             anyhow::bail!("hidden {hidden} is not divisible by query_heads {query_heads}");
         }
         let head = hidden / query_heads;
         Ok(Self {
-            blocks,
+            blocks: blocks(runtime)?,
             xb: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
             xb2: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
             q: Tensor::zeros(
@@ -178,22 +253,8 @@ pub struct SwiGluMlp {
 
 impl SwiGluMlp {
     pub fn new(runtime: &Runtime, hidden: u32, intermediate: u32) -> anyhow::Result<Self> {
-        Self::with_blocks(
-            runtime,
-            Arc::new(Blocks::prepare(runtime)?),
-            hidden,
-            intermediate,
-        )
-    }
-
-    pub fn with_blocks(
-        runtime: &Runtime,
-        blocks: Arc<Blocks>,
-        hidden: u32,
-        intermediate: u32,
-    ) -> anyhow::Result<Self> {
         Ok(Self {
-            blocks,
+            blocks: blocks(runtime)?,
             xb: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
             hb: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,
             hb2: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,

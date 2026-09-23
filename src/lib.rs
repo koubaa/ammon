@@ -5,7 +5,7 @@ pub mod model;
 pub mod tokenizer;
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub mod blocks;
+mod blocks;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod gpu;
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -14,10 +14,9 @@ pub mod kernels;
 pub mod modules;
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub use blocks::Blocks;
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use modules::{
-    AttentionWeights, CausalSelfAttention, KvCache, KvLayer, SwiGluMlp, SwiGluWeights,
+    AttentionWeights, CausalSelfAttention, Embedding, KvCache, KvLayer, Linear, RmsNorm, SwiGluMlp,
+    SwiGluWeights,
 };
 
 pub use generate::{

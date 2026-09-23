@@ -1,17 +1,18 @@
-//! Decoder blocks recorded as includable schemes.
+//! Prepared kernels shared per [`goldy::Runtime`].
 //!
-//! Each function writes dispatches into a grouped child [`goldy::Scheme`]. Exchanges
-//! stay on the submitting root; these blocks only bind retained parcels.
+//! Modules record dispatches into a [`goldy::Scheme`]. Exchanges stay on the
+//! submitting root; these functions only bind retained parcels.
 
 use crate::kernels::{
     AttentionKernel, EmbedKernel, GemvKernel, RmsnormInplaceKernel, RmsnormKernel, RopeKernel,
     SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
 };
 use anyhow::Context;
-use goldy::{Buffer, GoldyError, Scheme, SchemeLabel, TensorView};
+use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorView};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
-pub struct Blocks {
+pub(crate) struct Blocks {
     embed: EmbedKernel,
     rmsnorm: RmsnormKernel,
     rmsnorm_inplace: RmsnormInplaceKernel,
@@ -52,7 +53,22 @@ pub(crate) struct FfnSites<'a> {
 }
 
 impl Blocks {
-    pub fn prepare(runtime: &goldy::Runtime) -> anyhow::Result<Self> {
+    pub(crate) fn shared(runtime: &Runtime) -> anyhow::Result<Arc<Self>> {
+        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        let mut cache = cache.lock().expect("blocks cache");
+        let key = runtime.substrate_ptr() as usize;
+        cache.retain(|(_, weak)| weak.strong_count() > 0);
+        if let Some((_, weak)) = cache.iter().find(|(k, _)| *k == key) {
+            if let Some(blocks) = weak.upgrade() {
+                return Ok(blocks);
+            }
+        }
+        let blocks = Arc::new(Self::prepare(runtime)?);
+        cache.push((key, Arc::downgrade(&blocks)));
+        Ok(blocks)
+    }
+
+    fn prepare(runtime: &Runtime) -> anyhow::Result<Self> {
         Ok(Self {
             embed: EmbedKernel::prepare(runtime).context("prepare embed kernel")?,
             rmsnorm: RmsnormKernel::prepare(runtime).context("prepare rmsnorm kernel")?,
@@ -67,7 +83,7 @@ impl Blocks {
     }
 
     /// Token-row gather into `x`.
-    pub fn record_embed(
+    pub(crate) fn record_embed(
         &self,
         scheme: &mut Scheme,
         table: TensorView<'_>,
@@ -77,18 +93,6 @@ impl Blocks {
         self.embed
             .record(scheme, "embed", table, step, x)?
             .over_tensor(&x);
-        Ok(())
-    }
-
-    pub fn record_embed_group(
-        &self,
-        worker: &mut Scheme,
-        label: impl Into<SchemeLabel>,
-        table: TensorView<'_>,
-        step: &Buffer,
-        x: TensorView<'_>,
-    ) -> Result<(), GoldyError> {
-        worker.group(label, |scheme| self.record_embed(scheme, table, step, x))?;
         Ok(())
     }
 
@@ -169,38 +173,44 @@ impl Blocks {
         Ok(())
     }
 
-    /// Final RMSNorm and classifier GEMV into `logits`.
-    pub fn record_logits(
+    pub(crate) fn record_rmsnorm(
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
-        rms_final: TensorView<'_>,
-        classifier: TensorView<'_>,
-        logits: TensorView<'_>,
+        weight: TensorView<'_>,
+        out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.rmsnorm_inplace
-            .record(scheme, "rmsnorm", x, rms_final)?
+        self.rmsnorm
+            .record(scheme, "rmsnorm", x, weight, out)?
             .groups([1, 1, 1]);
-        self.tensors
-            .matmul_into(scheme, "classifier", classifier, x, logits)?;
         Ok(())
     }
 
-    pub fn record_logits_group(
+    pub(crate) fn record_rmsnorm_inplace(
         &self,
-        worker: &mut Scheme,
-        label: impl Into<SchemeLabel>,
+        scheme: &mut Scheme,
         x: TensorView<'_>,
-        rms_final: TensorView<'_>,
-        classifier: TensorView<'_>,
-        logits: TensorView<'_>,
+        weight: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        worker.group(label, |scheme| {
-            self.record_logits(scheme, x, rms_final, classifier, logits)
-        })?;
+        self.rmsnorm_inplace
+            .record(scheme, "rmsnorm", x, weight)?
+            .groups([1, 1, 1]);
         Ok(())
     }
+
+    pub(crate) fn record_linear(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        weight: TensorView<'_>,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors.matmul_into(scheme, label, weight, x, out)
+    }
 }
+
+static CACHE: OnceLock<Mutex<Vec<(usize, Weak<Blocks>)>>> = OnceLock::new();
 
 /// `[seq, kv_heads, head]` packed as the GEMV destination `[seq, kv_dim]`.
 fn cache_rows(cache: TensorView<'_>) -> Result<TensorView<'_>, GoldyError> {
