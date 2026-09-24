@@ -4,8 +4,8 @@
 
 use ammon::gpu::create_runtime;
 use ammon::kernels::{
-    DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel, SwigluKernel, TensorKernels,
-    DEFAULT_ROPE_THETA,
+    CacheStoreKernel, DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel,
+    RopeStoreKernel, SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
 };
 use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
@@ -231,6 +231,109 @@ fn tensor_add_into_is_elementwise() {
         .add_into(&mut scheme, "add", a.view(), b.view(), out.view())
         .unwrap();
     assert_eq!(read_f32(&mut scheme, out.buffer()), vec![4.0, 6.0]);
+}
+
+#[test]
+fn rope_store_writes_rotated_k_from_scratch() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    // head = 2, one query head. Position 0 is a no-op rotation (cos=1, sin=0).
+    let q = Tensor::from_f32(&device, TensorShape::matrix(1, 2), &[1.0, 2.0]).unwrap();
+    let k_proj = Tensor::from_f32(&device, TensorShape::vector(2), &[3.0, 4.0]).unwrap();
+    let k = Tensor::zeros(
+        &device,
+        TensorShape::from_dims(&[2, 1, 2]).unwrap(),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let step = step_buf(&device, 0, 1);
+    let kernel = RopeStoreKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    kernel
+        .record(
+            &mut scheme,
+            "rope_store",
+            q.view(),
+            k_proj.view(),
+            k.view(),
+            &step,
+            DEFAULT_ROPE_THETA,
+        )
+        .unwrap()
+        .over_1d(1);
+    let q_out = read_f32(&mut scheme, q.buffer());
+    let k_out = read_f32(&mut scheme, k.buffer());
+    // pos 1, head_dim 0: freq = 1, val = 1, so this is a real rotation of both pairs.
+    let (fcr, fci) = (1.0f32.cos(), 1.0f32.sin());
+    let rotate = |a: f32, b: f32| (a * fcr - b * fci, a * fci + b * fcr);
+    let (q0, q1) = rotate(1.0, 2.0);
+    let (k0, k1) = rotate(3.0, 4.0);
+    assert!(
+        (q_out[0] - q0).abs() < 1e-5 && (q_out[1] - q1).abs() < 1e-5,
+        "{q_out:?}"
+    );
+    assert_eq!(k_out[..2], [0.0, 0.0]);
+    assert!(
+        (k_out[2] - k0).abs() < 1e-5 && (k_out[3] - k1).abs() < 1e-5,
+        "{k_out:?}"
+    );
+}
+
+#[test]
+fn cache_store_writes_row_at_position() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let src = Tensor::from_f32(&device, TensorShape::vector(2), &[9.0, 8.0]).unwrap();
+    let dst = Tensor::zeros(
+        &device,
+        TensorShape::from_dims(&[3, 1, 2]).unwrap(),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let step = step_buf(&device, 0, 2);
+    let kernel = CacheStoreKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    kernel
+        .record(&mut scheme, "store", src.view(), dst.view(), &step)
+        .unwrap()
+        .over_1d(2);
+    assert_eq!(
+        read_f32(&mut scheme, dst.buffer()),
+        vec![0.0, 0.0, 0.0, 0.0, 9.0, 8.0]
+    );
+}
+
+#[test]
+fn semantic_gemv_then_cache_store_matches_serial_identity() {
+    // Identity weights make the reduction a single product, so cuBLAS and the
+    // serial kernel agree bit-for-bit. Wider reductions may not.
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let x = Tensor::from_f32(&device, TensorShape::vector(2), &[1.0, 2.0]).unwrap();
+    let w = Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 0.0, 0.0, 1.0]).unwrap();
+    let scratch = Tensor::zeros(&device, TensorShape::vector(4), TensorDType::F32).unwrap();
+    let cache = Tensor::zeros(
+        &device,
+        TensorShape::from_dims(&[3, 1, 2]).unwrap(),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let step = step_buf(&device, 0, 1);
+    let tensors = TensorKernels::prepare(&device).unwrap();
+    let store = CacheStoreKernel::prepare(&device).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    let proj = scratch.view().narrow(0, 0, 2).unwrap();
+    tensors
+        .matmul_into(&mut scheme, "wv", w.view(), x.view(), proj)
+        .unwrap();
+    store
+        .record(&mut scheme, "wv_store", proj, cache.view(), &step)
+        .unwrap()
+        .over_1d(2);
+    assert_eq!(
+        read_f32(&mut scheme, cache.buffer()),
+        vec![0.0, 0.0, 1.0, 2.0, 0.0, 0.0]
+    );
 }
 
 #[test]

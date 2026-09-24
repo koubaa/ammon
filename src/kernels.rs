@@ -46,8 +46,11 @@ fn embed(
     }
 }
 
-/// Position-strided KV-cache writer: `[n] × [d, n] -> [seq, d]` at `step.position`.
-/// Ordinary rank-1 GEMV stays Goldy semantic matmul.
+/// Position-strided serial GEMV: `[n] × [d, n] -> [seq, d]` at `step.position`.
+///
+/// The decode path does not use this. `wk` / `wv` are semantic matmuls into scratch,
+/// then [`rope_store`] and [`cache_store`] write the cache. This kernel remains the
+/// exact serial reference for tests.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn gemv(
     #[tensor(shape = [n])] x: goldy::gpu::Tensor<f32>,
@@ -124,7 +127,10 @@ fn rmsnorm_inplace(
     }
 }
 
-/// Pairwise RoPE on Q heads and the current K cache row.
+/// Pairwise RoPE on Q and an already-written K cache row.
+///
+/// Decode uses [`rope_store`], which reads unrotated K from scratch. This kernel
+/// rotates K in place and is the identity check at position 0.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rope(
     #[tensor(shape = [q_heads, head])] q: goldy::gpu::TensorMut<f32>,
@@ -163,6 +169,60 @@ fn rope(
             k[k_base + i + 1] = v0 * fci + v1 * fcr;
         }
     }
+}
+
+/// Rotate Q in place, and write RoPE(K) from a flat projection into `k[step.position]`.
+///
+/// One thread owns pair `(2i, 2i+1)`. Q pairs cover the full query width. K pairs
+/// stop at `k_proj.len()`, which is `kv_dim` and is at most the query width.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn rope_store(
+    #[tensor(shape = [q_heads, head])] q: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [kv_dim])] k_proj: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] k: goldy::gpu::TensorWrite<f32>,
+    step: &[DecodeStep],
+    theta: f32,
+) {
+    let i = goldy::gpu::global_id().x * 2;
+    let dim = q.len();
+    if i >= dim {
+        return;
+    }
+    let pos = step[0].position;
+    let head_size = q.dim(1);
+    let kv_dim = k_proj.len();
+    let k_base = pos * kv_dim;
+    let head_dim = (i % head_size) as i32;
+    let freq = 1.0 / goldy::gpu::pow(theta, (head_dim as f32) / (head_size as f32));
+    let val = (pos as f32) * freq;
+    let fcr = goldy::gpu::cos(val);
+    let fci = goldy::gpu::sin(val);
+    let q0 = q[i];
+    let q1 = q[i + 1];
+    q[i] = q0 * fcr - q1 * fci;
+    q[i + 1] = q0 * fci + q1 * fcr;
+    if i < kv_dim {
+        let k0 = k_proj[i];
+        let k1 = k_proj[i + 1];
+        k[k_base + i] = k0 * fcr - k1 * fci;
+        k[k_base + i + 1] = k0 * fci + k1 * fcr;
+    }
+}
+
+/// Copy a flat projection into `dst[step.position]`.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn cache_store(
+    #[tensor(shape = [kv_dim])] src: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] dst: goldy::gpu::TensorWrite<f32>,
+    step: &[DecodeStep],
+) {
+    let i = goldy::gpu::global_id().x;
+    if i >= src.len() {
+        return;
+    }
+    let row = dst.dim(1) * dst.dim(2);
+    let out_i = step[0].position * row + i;
+    dst[out_i] = src[i];
 }
 
 /// Multi-head attention (one workgroup per head). Inclusive over `t <= pos`.
@@ -229,11 +289,13 @@ fn swiglu(
 }
 
 pub use attention::Kernel as AttentionKernel;
+pub use cache_store::Kernel as CacheStoreKernel;
 pub use embed::Kernel as EmbedKernel;
 pub use gemv::Kernel as GemvKernel;
 pub use rmsnorm::Kernel as RmsnormKernel;
 pub use rmsnorm_inplace::Kernel as RmsnormInplaceKernel;
 pub use rope::Kernel as RopeKernel;
+pub use rope_store::Kernel as RopeStoreKernel;
 pub use swiglu::Kernel as SwigluKernel;
 
 /// Goldy tensor add / semantic matmul, prepared once per runtime.

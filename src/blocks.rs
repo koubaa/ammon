@@ -4,8 +4,8 @@
 //! submitting root; these functions only bind retained parcels.
 
 use crate::kernels::{
-    AttentionKernel, EmbedKernel, GemvKernel, RmsnormInplaceKernel, RmsnormKernel, RopeKernel,
-    SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
+    AttentionKernel, CacheStoreKernel, EmbedKernel, RmsnormInplaceKernel, RmsnormKernel,
+    RopeStoreKernel, SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
 };
 use anyhow::Context;
 use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorView};
@@ -16,8 +16,8 @@ pub(crate) struct Blocks {
     embed: EmbedKernel,
     rmsnorm: RmsnormKernel,
     rmsnorm_inplace: RmsnormInplaceKernel,
-    gemv: GemvKernel,
-    rope: RopeKernel,
+    rope_store: RopeStoreKernel,
+    cache_store: CacheStoreKernel,
     attention: AttentionKernel,
     swiglu: SwigluKernel,
     tensors: TensorKernels,
@@ -74,8 +74,9 @@ impl Blocks {
             rmsnorm: RmsnormKernel::prepare(runtime).context("prepare rmsnorm kernel")?,
             rmsnorm_inplace: RmsnormInplaceKernel::prepare(runtime)
                 .context("prepare rmsnorm_inplace kernel")?,
-            gemv: GemvKernel::prepare(runtime).context("prepare gemv kernel")?,
-            rope: RopeKernel::prepare(runtime).context("prepare rope kernel")?,
+            rope_store: RopeStoreKernel::prepare(runtime).context("prepare rope_store kernel")?,
+            cache_store: CacheStoreKernel::prepare(runtime)
+                .context("prepare cache_store kernel")?,
             attention: AttentionKernel::prepare(runtime).context("prepare attention kernel")?,
             swiglu: SwigluKernel::prepare(runtime).context("prepare swiglu kernel")?,
             tensors: TensorKernels::prepare(runtime).context("prepare tensor kernels")?,
@@ -98,10 +99,9 @@ impl Blocks {
 
     /// RMSNorm, Q/K/V, RoPE, attention, output projection, residual into `x`.
     ///
-    /// `key` and `value` are one layer, `[seq, kv_heads, head]`. The cache GEMV
-    /// sees that storage as `[seq, kv_dim]`; RoPE and attention keep the head view.
-    /// `q` is `[q_heads, head]` and `att` is `[q_heads, seq]`; only the projection
-    /// destination and cache-writer views are flattened for GEMV.
+    /// `wk` and `wv` are semantic GEMVs into the prefix of `xb2`. [`RopeStoreKernel`]
+    /// rotates Q in place and writes RoPE(K) into the cache. [`CacheStoreKernel`]
+    /// copies V into the cache. `wo` reuses all of `xb2` after those stores.
     pub(crate) fn record_attention(
         &self,
         scheme: &mut Scheme,
@@ -112,25 +112,47 @@ impl Blocks {
         let q = sites.q;
         let q_flat = q.reshape(&[q.numel_u32()])?;
         let xb_heads = sites.xb.reshape(&[q_heads, head])?;
-        let kv_width = sites.wk.shape().dim(0)?;
-        let wv_rows = sites.wv.shape().dim(0)?;
-        let key_rows = cache_rows(sites.key)?;
-        let value_rows = cache_rows(sites.value)?;
+        let kv_dim = sites.wk.shape().dim(0)?;
+        if sites.wv.shape().dim(0)? != kv_dim {
+            return Err(GoldyError::Validation(
+                "attention: wk and wv row counts differ".into(),
+            ));
+        }
+        if kv_dim > q.numel_u32() || kv_dim % 2 != 0 {
+            return Err(GoldyError::Validation(
+                "attention: kv width must be even and no wider than q".into(),
+            ));
+        }
+        if sites.xb2.numel_u32() < kv_dim {
+            return Err(GoldyError::Validation(
+                "attention: xb2 is shorter than the kv projection".into(),
+            ));
+        }
+        let proj = sites.xb2.narrow(0, 0, kv_dim)?;
 
         self.rmsnorm
             .record(scheme, "rmsnorm", sites.x, sites.rms, sites.xb)?
             .groups([1, 1, 1]);
         self.tensors
             .matmul_into(scheme, "wq", sites.wq, sites.xb, q_flat)?;
-        self.gemv
-            .record(scheme, "wk", sites.xb, sites.wk, key_rows, sites.step)?
-            .over_1d(kv_width);
-        self.gemv
-            .record(scheme, "wv", sites.xb, sites.wv, value_rows, sites.step)?
-            .over_1d(wv_rows);
-        self.rope
-            .record(scheme, "rope", q, sites.key, sites.step, DEFAULT_ROPE_THETA)?
+        self.tensors
+            .matmul_into(scheme, "wk", sites.wk, sites.xb, proj)?;
+        self.rope_store
+            .record(
+                scheme,
+                "rope",
+                q,
+                proj,
+                sites.key,
+                sites.step,
+                DEFAULT_ROPE_THETA,
+            )?
             .over_1d((q.numel_u32() / 2).max(1));
+        self.tensors
+            .matmul_into(scheme, "wv", sites.wv, sites.xb, proj)?;
+        self.cache_store
+            .record(scheme, "wv_store", proj, sites.value, sites.step)?
+            .over_1d(kv_dim);
         self.attention
             .record(
                 scheme,
@@ -211,10 +233,3 @@ impl Blocks {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Weak<Blocks>)>>> = OnceLock::new();
-
-/// `[seq, kv_heads, head]` packed as the GEMV destination `[seq, kv_dim]`.
-fn cache_rows(cache: TensorView<'_>) -> Result<TensorView<'_>, GoldyError> {
-    let seq = cache.shape().dim(0)?;
-    let kv_dim = cache.numel_u32() / seq;
-    cache.reshape(&[seq, kv_dim])
-}
