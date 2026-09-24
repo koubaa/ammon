@@ -495,7 +495,7 @@ fn split_attention_matches_reference_across_split_boundaries() {
         kv_heads: 6,
         head: 48,
         seq: 256,
-        positions: &[0, 1, 31, 32, 33, 100, 255],
+        positions: &[0, 1, 7, 8, 9, 31, 32, 33, 100, 255],
     });
 }
 
@@ -522,6 +522,13 @@ fn split_attention_matches_reference_for_gqa_and_head_widths() {
             head: 20,
             seq: 33,
             positions: &[5, 32],
+        },
+        AttentionCase {
+            q_heads: 1,
+            kv_heads: 1,
+            head: 32,
+            seq: 2112,
+            positions: &[2047, 2111],
         },
     ] {
         assert_split_attention_matches_reference(case);
