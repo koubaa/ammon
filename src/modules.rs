@@ -2,7 +2,7 @@
 //! the caller supplies activations, weights, and persistent cache. Modules never
 //! submit schemes or bind exchanges.
 
-use crate::blocks::{AttentionSites, Blocks, FfnSites};
+use crate::blocks::{attention_splits, AttentionSites, Blocks, FfnSites};
 use goldy::{
     Buffer, GoldyError, Runtime, Scheme, SchemeLabel, Tensor, TensorDType, TensorShape, TensorView,
 };
@@ -166,13 +166,13 @@ impl Linear {
 
 /// Pre-norm causal attention block: RMSNorm, QKV, RoPE, attention, projection, residual.
 ///
-/// Owns decode scratch (`xb`, `xb2`, `q`, `att`).
+/// Owns decode scratch (`xb`, `xb2`, `q`, flash-decoding `partial`).
 pub struct CausalAttentionBlock {
     blocks: Arc<Blocks>,
     xb: Tensor,
     xb2: Tensor,
     q: Tensor,
-    att: Tensor,
+    partial: Tensor,
 }
 
 impl CausalAttentionBlock {
@@ -195,9 +195,9 @@ impl CausalAttentionBlock {
                 TensorShape::from_dims(&[query_heads, head])?,
                 TensorDType::F32,
             )?,
-            att: Tensor::zeros(
+            partial: Tensor::zeros(
                 runtime,
-                TensorShape::from_dims(&[query_heads, seq_len])?,
+                TensorShape::from_dims(&[query_heads, attention_splits(seq_len), head + 2])?,
                 TensorDType::F32,
             )?,
         })
@@ -218,7 +218,7 @@ impl CausalAttentionBlock {
                 xb: self.xb.view(),
                 xb2: self.xb2.view(),
                 q: self.q.view(),
-                att: self.att.view(),
+                partial: self.partial.view(),
                 key: cache.key,
                 value: cache.value,
                 step,

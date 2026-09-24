@@ -225,7 +225,158 @@ fn cache_store(
     dst[out_i] = src[i];
 }
 
-/// Multi-head attention (one workgroup per head). Inclusive over `t <= pos`.
+/// Cached positions reduced by one [`attention_partial`] workgroup.
+pub const ATTENTION_SPLIT: u32 = 32;
+/// Widest head [`attention_partial`] and [`attention_combine`] cover (128 threads).
+pub const ATTENTION_MAX_HEAD: u32 = 128;
+
+/// Flash-decoding pass 1. Workgroup `h * splits + s` scores positions
+/// `[32 s, 32 s + 32)` clipped to `t <= pos` for query head `h`.
+///
+/// Writes `Σ exp(score - m) · v` to `partial[h, s, ..head]`, the split max `m` to
+/// `partial[h, s, head]` and `Σ exp(score - m)` to `partial[h, s, head + 1]`.
+/// Splits that start past `pos` return without writing; [`attention_combine`] reads
+/// only live splits. Requires `head <= 128`.
+#[goldy::compute(workgroup_size = [128, 1, 1])]
+fn attention_partial(
+    #[tensor(shape = [q_heads, head])] q: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] key_cache: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [seq, kv_heads, head])] value_cache: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, splits, slot])] partial: goldy::gpu::TensorWrite<f32>,
+    step: &[DecodeStep],
+) {
+    let mut qs = goldy::gpu::workgroup_array::<f32, 128>();
+    let mut lanes = goldy::gpu::workgroup_array::<f32, 128>();
+    let mut scores = goldy::gpu::workgroup_array::<f32, 32>();
+    let mut probs = goldy::gpu::workgroup_array::<f32, 32>();
+    let local = goldy::gpu::local_id().x;
+    let splits = partial.dim(1);
+    let group = goldy::gpu::workgroup_id().x;
+    let h = group / splits;
+    let split = group % splits;
+    let pos = step[0].position;
+    let t0 = split * 32;
+    if t0 > pos {
+        return;
+    }
+    let mut n = pos + 1 - t0;
+    if n > 32 {
+        n = 32;
+    }
+    let head_size = q.dim(1);
+    let kv_mul = q.dim(0) / key_cache.dim(1);
+    let kv_dim = key_cache.dim(1) * head_size;
+    let head_base = (h / kv_mul) * head_size;
+
+    if local < head_size {
+        qs[local] = q[h * head_size + local];
+    }
+    goldy::gpu::workgroup_barrier();
+
+    // Four lanes per position; lane `l` sums dims `l, l + 4, ...`.
+    let p = local / 4;
+    let mut dot = 0.0;
+    if p < n {
+        let k_base = (t0 + p) * kv_dim + head_base;
+        let mut i = local % 4;
+        while i < head_size {
+            dot = dot + qs[i] * key_cache[k_base + i];
+            i = i + 4;
+        }
+    }
+    lanes[local] = dot;
+    goldy::gpu::workgroup_barrier();
+    if local < n {
+        let b = local * 4;
+        let sum = lanes[b] + lanes[b + 1] + lanes[b + 2] + lanes[b + 3];
+        scores[local] = sum / goldy::gpu::sqrt(head_size as f32);
+    }
+    goldy::gpu::workgroup_barrier();
+
+    let mut m = scores[0];
+    for j in 1..n {
+        let s = scores[j];
+        if s > m {
+            m = s;
+        }
+    }
+    if local < n {
+        probs[local] = goldy::gpu::exp(scores[local] - m);
+    }
+    goldy::gpu::workgroup_barrier();
+
+    // `ways` thread groups of `head` lanes split the positions, then fold.
+    let ways = 128 / head_size;
+    let way = local / head_size;
+    let i = local % head_size;
+    let mut acc = 0.0;
+    if way < ways {
+        let mut j = way;
+        while j < n {
+            acc = acc + probs[j] * value_cache[(t0 + j) * kv_dim + head_base + i];
+            j = j + ways;
+        }
+    }
+    lanes[local] = acc;
+    goldy::gpu::workgroup_barrier();
+
+    let out = (h * splits + split) * partial.dim(2);
+    if local < head_size {
+        let mut total = lanes[local];
+        for w in 1..ways {
+            total = total + lanes[w * head_size + local];
+        }
+        partial[out + local] = total;
+    }
+    if local == 0 {
+        let mut l = 0.0;
+        for j in 0..n {
+            l = l + probs[j];
+        }
+        partial[out + head_size] = m;
+        partial[out + head_size + 1] = l;
+    }
+}
+
+/// Flash-decoding pass 2: rescale and sum the live [`attention_partial`] splits of
+/// head `workgroup_id().x` into `xb[h]`.
+#[goldy::compute(workgroup_size = [128, 1, 1])]
+fn attention_combine(
+    #[tensor(shape = [q_heads, splits, slot])] partial: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, head])] xb: goldy::gpu::TensorWrite<f32>,
+    step: &[DecodeStep],
+) {
+    let h = goldy::gpu::workgroup_id().x;
+    let i = goldy::gpu::local_id().x;
+    let head_size = xb.dim(1);
+    if i >= head_size {
+        return;
+    }
+    let slot = partial.dim(2);
+    let base = h * partial.dim(1) * slot;
+    let live = step[0].position / 32 + 1;
+    let mut m = partial[base + head_size];
+    for s in 1..live {
+        let v = partial[base + s * slot + head_size];
+        if v > m {
+            m = v;
+        }
+    }
+    let mut l = 0.0;
+    let mut acc = 0.0;
+    for s in 0..live {
+        let o = base + s * slot;
+        let w = goldy::gpu::exp(partial[o + head_size] - m);
+        l = l + partial[o + head_size + 1] * w;
+        acc = acc + partial[o + i] * w;
+    }
+    xb[h * head_size + i] = acc / l;
+}
+
+/// Serial multi-head attention (one workgroup per head). Inclusive over `t <= pos`.
+///
+/// Decode uses [`attention_partial`] plus [`attention_combine`]. This kernel remains
+/// the exact reference for tests.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn attention(
     #[tensor(shape = [q_heads, head])] q: goldy::gpu::Tensor<f32>,
@@ -289,6 +440,8 @@ fn swiglu(
 }
 
 pub use attention::Kernel as AttentionKernel;
+pub use attention_combine::Kernel as AttentionCombineKernel;
+pub use attention_partial::Kernel as AttentionPartialKernel;
 pub use cache_store::Kernel as CacheStoreKernel;
 pub use embed::Kernel as EmbedKernel;
 pub use gemv::Kernel as GemvKernel;

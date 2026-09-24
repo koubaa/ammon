@@ -4,8 +4,9 @@
 //! submitting root; these functions only bind retained parcels.
 
 use crate::kernels::{
-    AttentionKernel, CacheStoreKernel, EmbedKernel, RmsnormInplaceKernel, RmsnormKernel,
-    RopeStoreKernel, SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
+    AttentionCombineKernel, AttentionPartialKernel, CacheStoreKernel, EmbedKernel,
+    RmsnormInplaceKernel, RmsnormKernel, RopeStoreKernel, SwigluKernel, TensorKernels,
+    ATTENTION_MAX_HEAD, ATTENTION_SPLIT, DEFAULT_ROPE_THETA,
 };
 use anyhow::Context;
 use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorView};
@@ -18,7 +19,8 @@ pub(crate) struct Blocks {
     rmsnorm_inplace: RmsnormInplaceKernel,
     rope_store: RopeStoreKernel,
     cache_store: CacheStoreKernel,
-    attention: AttentionKernel,
+    attention_partial: AttentionPartialKernel,
+    attention_combine: AttentionCombineKernel,
     swiglu: SwigluKernel,
     tensors: TensorKernels,
 }
@@ -29,7 +31,8 @@ pub(crate) struct AttentionSites<'a> {
     pub xb: TensorView<'a>,
     pub xb2: TensorView<'a>,
     pub q: TensorView<'a>,
-    pub att: TensorView<'a>,
+    /// `[q_heads, attention_splits(seq), head + 2]` flash-decoding scratch.
+    pub partial: TensorView<'a>,
     pub key: TensorView<'a>,
     pub value: TensorView<'a>,
     pub step: &'a Buffer,
@@ -77,7 +80,10 @@ impl Blocks {
             rope_store: RopeStoreKernel::prepare(runtime).context("prepare rope_store kernel")?,
             cache_store: CacheStoreKernel::prepare(runtime)
                 .context("prepare cache_store kernel")?,
-            attention: AttentionKernel::prepare(runtime).context("prepare attention kernel")?,
+            attention_partial: AttentionPartialKernel::prepare(runtime)
+                .context("prepare attention_partial kernel")?,
+            attention_combine: AttentionCombineKernel::prepare(runtime)
+                .context("prepare attention_combine kernel")?,
             swiglu: SwigluKernel::prepare(runtime).context("prepare swiglu kernel")?,
             tensors: TensorKernels::prepare(runtime).context("prepare tensor kernels")?,
         })
@@ -128,6 +134,18 @@ impl Blocks {
                 "attention: xb2 is shorter than the kv projection".into(),
             ));
         }
+        if head > ATTENTION_MAX_HEAD {
+            return Err(GoldyError::Validation(format!(
+                "attention: head size {head} exceeds {ATTENTION_MAX_HEAD}"
+            )));
+        }
+        let splits = attention_splits(sites.key.shape().dim(0)?);
+        let partial_dims = [q_heads, splits, head + 2];
+        if sites.partial.shape().dims() != partial_dims {
+            return Err(GoldyError::Validation(format!(
+                "attention: partial scratch must be {partial_dims:?}"
+            )));
+        }
         let proj = sites.xb2.narrow(0, 0, kv_dim)?;
 
         self.rmsnorm
@@ -153,17 +171,19 @@ impl Blocks {
         self.cache_store
             .record(scheme, "wv_store", proj, sites.value, sites.step)?
             .over_1d(kv_dim);
-        self.attention
+        self.attention_partial
             .record(
                 scheme,
-                "attn",
+                "attn_partial",
                 q,
-                sites.att,
-                xb_heads,
                 sites.key,
                 sites.value,
+                sites.partial,
                 sites.step,
             )?
+            .groups([q_heads * splits, 1, 1]);
+        self.attention_combine
+            .record(scheme, "attn_combine", sites.partial, xb_heads, sites.step)?
             .groups([q_heads, 1, 1]);
         self.tensors
             .matmul_into(scheme, "wo", sites.wo, sites.xb, sites.xb2)?;
@@ -230,6 +250,11 @@ impl Blocks {
     ) -> Result<(), GoldyError> {
         self.tensors.matmul_into(scheme, label, weight, x, out)
     }
+}
+
+/// Flash-decoding splits covering `seq_len` cached positions.
+pub(crate) fn attention_splits(seq_len: u32) -> u32 {
+    seq_len.div_ceil(ATTENTION_SPLIT).max(1)
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Weak<Blocks>)>>> = OnceLock::new();

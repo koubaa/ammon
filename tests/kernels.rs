@@ -4,8 +4,9 @@
 
 use ammon::gpu::create_runtime;
 use ammon::kernels::{
-    CacheStoreKernel, DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel,
-    RopeStoreKernel, SwigluKernel, TensorKernels, DEFAULT_ROPE_THETA,
+    AttentionCombineKernel, AttentionKernel, AttentionPartialKernel, CacheStoreKernel,
+    DecodeStep, EmbedKernel, GemvKernel, RmsnormKernel, RopeKernel, RopeStoreKernel,
+    SwigluKernel, TensorKernels, ATTENTION_SPLIT, DEFAULT_ROPE_THETA,
 };
 use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
@@ -372,6 +373,159 @@ fn rope_rejects_rank2_kv_cache() {
     assert!(err.to_string().contains("parameter `k`"), "{err}");
     assert!(err.to_string().contains("expected rank 3"), "{err}");
     assert_eq!(scheme.ir_node_count(), before);
+}
+
+fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state % 2001) as f32 / 1000.0 - 1.0
+        })
+        .collect()
+}
+
+struct AttentionCase {
+    q_heads: u32,
+    kv_heads: u32,
+    head: u32,
+    seq: u32,
+    positions: &'static [u32],
+}
+
+fn cpu_attention(case: &AttentionCase, q: &[f32], key: &[f32], value: &[f32], pos: u32) -> Vec<f64> {
+    let (head, kv_dim) = (case.head as usize, (case.kv_heads * case.head) as usize);
+    let kv_mul = (case.q_heads / case.kv_heads) as usize;
+    let mut out = vec![0.0f64; case.q_heads as usize * head];
+    for h in 0..case.q_heads as usize {
+        let kv_base = (h / kv_mul) * head;
+        let scores: Vec<f64> = (0..=pos as usize)
+            .map(|t| {
+                let dot: f64 = (0..head)
+                    .map(|i| f64::from(q[h * head + i]) * f64::from(key[t * kv_dim + kv_base + i]))
+                    .sum();
+                dot / (head as f64).sqrt()
+            })
+            .collect();
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        for i in 0..head {
+            out[h * head + i] = weights
+                .iter()
+                .enumerate()
+                .map(|(t, w)| w * f64::from(value[t * kv_dim + kv_base + i]))
+                .sum::<f64>()
+                / total;
+        }
+    }
+    out
+}
+
+fn assert_split_attention_matches_reference(case: AttentionCase) {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let partial_kernel = AttentionPartialKernel::prepare(&device).unwrap();
+    let combine_kernel = AttentionCombineKernel::prepare(&device).unwrap();
+    let serial_kernel = AttentionKernel::prepare(&device).unwrap();
+    let (q_heads, head, seq) = (case.q_heads, case.head, case.seq);
+    let splits = seq.div_ceil(ATTENTION_SPLIT);
+    let cache_dims = [seq, case.kv_heads, head];
+    let cache_len = (seq * case.kv_heads * head) as usize;
+    let q_host = pseudo_random((q_heads * head) as usize, 11);
+    let key_host = pseudo_random(cache_len, 12);
+    let value_host = pseudo_random(cache_len, 13);
+    let q = Tensor::from_f32(&device, TensorShape::matrix(q_heads, head), &q_host).unwrap();
+    let key = Tensor::from_f32(&device, TensorShape::from_dims(&cache_dims).unwrap(), &key_host).unwrap();
+    let value =
+        Tensor::from_f32(&device, TensorShape::from_dims(&cache_dims).unwrap(), &value_host).unwrap();
+    for &pos in case.positions {
+        let step = step_buf(&device, 0, pos);
+        // Dead splits keep NaN; the combine must never read them.
+        let partial_dims = [q_heads, splits, head + 2];
+        let poison = vec![f32::NAN; (q_heads * splits * (head + 2)) as usize];
+        let partial =
+            Tensor::from_f32(&device, TensorShape::from_dims(&partial_dims).unwrap(), &poison).unwrap();
+        let split_out = Tensor::zeros(&device, TensorShape::matrix(q_heads, head), TensorDType::F32).unwrap();
+        let serial_out = Tensor::zeros(&device, TensorShape::matrix(q_heads, head), TensorDType::F32).unwrap();
+        let att = Tensor::zeros(&device, TensorShape::matrix(q_heads, seq), TensorDType::F32).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        partial_kernel
+            .record(&mut scheme, "attn_partial", q.view(), key.view(), value.view(), partial.view(), &step)
+            .unwrap()
+            .groups([q_heads * splits, 1, 1]);
+        combine_kernel
+            .record(&mut scheme, "attn_combine", partial.view(), split_out.view(), &step)
+            .unwrap()
+            .groups([q_heads, 1, 1]);
+        serial_kernel
+            .record(
+                &mut scheme,
+                "attn_serial",
+                q.view(),
+                att.view(),
+                serial_out.view(),
+                key.view(),
+                value.view(),
+                &step,
+            )
+            .unwrap()
+            .groups([q_heads, 1, 1]);
+        let split = read_f32(&mut scheme, split_out.buffer());
+        let serial = read_f32(&mut scheme, serial_out.buffer());
+        let expected = cpu_attention(&case, &q_host, &key_host, &value_host, pos);
+        for (i, want) in expected.iter().enumerate() {
+            for (name, got) in [("split", split[i]), ("serial", serial[i])] {
+                assert!(
+                    (f64::from(got) - want).abs() < 1e-4,
+                    "{name} attention[{i}] = {got}, expected {want} (pos {pos}, head {head}, q_heads {q_heads}, kv_heads {})",
+                    case.kv_heads
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn split_attention_matches_reference_across_split_boundaries() {
+    assert_split_attention_matches_reference(AttentionCase {
+        q_heads: 6,
+        kv_heads: 6,
+        head: 48,
+        seq: 256,
+        positions: &[0, 1, 31, 32, 33, 100, 255],
+    });
+}
+
+#[test]
+fn split_attention_matches_reference_for_gqa_and_head_widths() {
+    for case in [
+        AttentionCase {
+            q_heads: 4,
+            kv_heads: 2,
+            head: 64,
+            seq: 80,
+            positions: &[0, 47, 79],
+        },
+        AttentionCase {
+            q_heads: 2,
+            kv_heads: 1,
+            head: 128,
+            seq: 40,
+            positions: &[39],
+        },
+        AttentionCase {
+            q_heads: 3,
+            kv_heads: 3,
+            head: 20,
+            seq: 33,
+            positions: &[5, 32],
+        },
+    ] {
+        assert_split_attention_matches_reference(case);
+    }
 }
 
 #[test]
