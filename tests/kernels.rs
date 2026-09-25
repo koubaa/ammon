@@ -216,7 +216,9 @@ fn deposit_feeds_embed_without_rerecord() {
             assert_eq!(got, vec![30.0, 40.0]);
         }
     }
-    assert_eq!(worker.replay_stats().records, 1);
+    // Promoting the node's layout variant is a params-only re-record; the deposit is not.
+    let stats = worker.replay_stats();
+    assert_eq!(stats.records - stats.specialization_promotions, 1);
 }
 
 #[test]
