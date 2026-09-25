@@ -2,7 +2,7 @@
 //! the caller supplies activations, weights, and persistent cache. Modules never
 //! submit schemes or bind exchanges.
 
-use crate::blocks::{attention_splits, AttentionSites, Blocks, FfnSites};
+use crate::blocks::{attention_splits, AttentionSites, Blocks, FfnSites, NormScratch};
 use goldy::{
     Buffer, GoldyError, Runtime, Scheme, SchemeLabel, Tensor, TensorDType, TensorShape, TensorView,
 };
@@ -72,6 +72,28 @@ fn squeeze_layer(cache: TensorView<'_>, layer: u32) -> Result<TensorView<'_>, Go
 
 fn blocks(runtime: &Runtime) -> anyhow::Result<Arc<Blocks>> {
     Blocks::shared(runtime)
+}
+
+/// Scratch of an RMSNorm recorded as tensor operations over `[hidden]`.
+struct Norm {
+    square: Tensor,
+    scale: Tensor,
+}
+
+impl Norm {
+    fn new(runtime: &Runtime, hidden: u32) -> Result<Self, GoldyError> {
+        Ok(Self {
+            square: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
+            scale: Tensor::zeros(runtime, TensorShape::vector(1), TensorDType::F32)?,
+        })
+    }
+
+    fn sites(&self) -> NormScratch<'_> {
+        NormScratch {
+            square: self.square.view(),
+            scale: self.scale.view(),
+        }
+    }
 }
 
 /// Token embedding table gather. No decode scratch.
@@ -166,13 +188,15 @@ impl Linear {
 
 /// Pre-norm causal attention block: RMSNorm, QKV, RoPE, attention, projection, residual.
 ///
-/// Owns decode scratch (`xb`, `xb2`, `q`, flash-decoding `partial`).
+/// Owns decode scratch (`xb`, `xb2`, `q`, `v`, flash-decoding `partial`).
 pub struct CausalAttentionBlock {
     blocks: Arc<Blocks>,
     xb: Tensor,
     xb2: Tensor,
     q: Tensor,
+    v: Tensor,
     partial: Tensor,
+    norm: Norm,
 }
 
 impl CausalAttentionBlock {
@@ -195,11 +219,13 @@ impl CausalAttentionBlock {
                 TensorShape::from_dims(&[query_heads, head])?,
                 TensorDType::F32,
             )?,
+            v: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
             partial: Tensor::zeros(
                 runtime,
                 TensorShape::from_dims(&[query_heads, attention_splits(seq_len), head + 2])?,
                 TensorDType::F32,
             )?,
+            norm: Norm::new(runtime, hidden)?,
         })
     }
 
@@ -218,7 +244,9 @@ impl CausalAttentionBlock {
                 xb: self.xb.view(),
                 xb2: self.xb2.view(),
                 q: self.q.view(),
+                v: self.v.view(),
                 partial: self.partial.view(),
+                norm: self.norm.sites(),
                 key: cache.key,
                 value: cache.value,
                 step,
@@ -247,12 +275,14 @@ impl CausalAttentionBlock {
 
 /// Pre-norm SwiGLU block: RMSNorm, gated MLP, residual.
 ///
-/// Owns decode scratch (`xb`, `hb`, `hb2`).
+/// Owns decode scratch (`xb`, `hb`, `hb2`, `gate`).
 pub struct SwiGluBlock {
     blocks: Arc<Blocks>,
     xb: Tensor,
     hb: Tensor,
     hb2: Tensor,
+    gate: Tensor,
+    norm: Norm,
 }
 
 impl SwiGluBlock {
@@ -262,6 +292,8 @@ impl SwiGluBlock {
             xb: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
             hb: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,
             hb2: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,
+            gate: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,
+            norm: Norm::new(runtime, hidden)?,
         })
     }
 
@@ -278,6 +310,8 @@ impl SwiGluBlock {
                 xb: self.xb.view(),
                 hb: self.hb.view(),
                 hb2: self.hb2.view(),
+                gate: self.gate.view(),
+                norm: self.norm.sites(),
                 rms: weights.norm,
                 w1: weights.gate,
                 w2: weights.down,

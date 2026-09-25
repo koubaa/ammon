@@ -526,4 +526,9 @@ impl TensorKernels {
         let label = label.into();
         self.ops.recorder(scheme).matmul_into(&label, a, b, out)
     }
+
+    /// Records Goldy tensor operations into `scheme`.
+    pub fn recorder<'a>(&'a self, scheme: &'a mut goldy::Scheme) -> goldy::TensorRecorder<'a> {
+        self.ops.recorder(scheme)
+    }
 }
