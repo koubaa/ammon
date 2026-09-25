@@ -136,7 +136,7 @@ fn rope(
     #[tensor(shape = [q_heads, head])] q: goldy::gpu::TensorMut<f32>,
     #[tensor(shape = [seq, kv_heads, head])] k: goldy::gpu::TensorMut<f32>,
     step: &[DecodeStep],
-    #[fact] theta: f32,
+    theta: f32,
 ) {
     let i = goldy::gpu::global_id().x * 2;
     let dim = q.len();
@@ -181,7 +181,7 @@ fn rope_store(
     #[tensor(shape = [kv_dim])] k_proj: goldy::gpu::Tensor<f32>,
     #[tensor(shape = [seq, kv_heads, head])] k: goldy::gpu::TensorWrite<f32>,
     step: &[DecodeStep],
-    #[fact] theta: f32,
+    theta: f32,
 ) {
     let i = goldy::gpu::global_id().x * 2;
     let dim = q.len();
