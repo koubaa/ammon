@@ -176,13 +176,35 @@ fn parse_byte_token(piece: &str) -> Option<u8> {
     u8::from_str_radix(rest, 16).ok()
 }
 
+/// Index of the first maximum of `logits`, skipping NaNs after the first element.
+///
+/// Sampling runs between decode steps with the GPU idle, so the scan keeps independent
+/// running maxima in `LANES` lanes, which vectorize, and merges them by value and then
+/// index.
 pub fn sample_argmax(logits: &[f32]) -> i32 {
-    let mut max_i = 0;
-    let mut max_p = logits[0];
-    for (i, &p) in logits.iter().enumerate().skip(1) {
+    const LANES: usize = 16;
+    let first = logits[0];
+    let mut best = [first; LANES];
+    let mut best_at = [0usize; LANES];
+    let chunks = logits.chunks_exact(LANES);
+    let tail_start = logits.len() - chunks.remainder().len();
+    for (c, chunk) in chunks.enumerate() {
+        let chunk: &[f32; LANES] = chunk.try_into().unwrap();
+        for l in 0..LANES {
+            let take = chunk[l] > best[l];
+            best[l] = if take { chunk[l] } else { best[l] };
+            best_at[l] = if take { c * LANES + l } else { best_at[l] };
+        }
+    }
+    let (mut max_i, mut max_p) = (0, first);
+    for l in 0..LANES {
+        if best[l] > max_p || (best[l] == max_p && best_at[l] < max_i) {
+            (max_i, max_p) = (best_at[l], best[l]);
+        }
+    }
+    for (i, &p) in logits.iter().enumerate().skip(tail_start) {
         if p > max_p {
-            max_i = i;
-            max_p = p;
+            (max_i, max_p) = (i, p);
         }
     }
     max_i as i32
@@ -225,6 +247,39 @@ mod tests {
     #[test]
     fn argmax_picks_first_on_ties() {
         assert_eq!(sample_argmax(&[1.0, 3.0, 3.0, 2.0]), 1);
+    }
+
+    #[test]
+    fn argmax_matches_a_sequential_scan() {
+        fn sequential(logits: &[f32]) -> i32 {
+            let (mut max_i, mut max_p) = (0, logits[0]);
+            for (i, &p) in logits.iter().enumerate().skip(1) {
+                if p > max_p {
+                    (max_i, max_p) = (i, p);
+                }
+            }
+            max_i as i32
+        }
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for len in [1, 2, 15, 16, 17, 31, 33, 100, 32000] {
+            for _ in 0..20 {
+                let logits: Vec<f32> = (0..len)
+                    .map(|_| match next() % 16 {
+                        0 => f32::NAN,
+                        1 => -0.0,
+                        2 => 0.0,
+                        _ => (next() % 8) as f32,
+                    })
+                    .collect();
+                assert_eq!(sample_argmax(&logits), sequential(&logits), "{logits:?}");
+            }
+        }
+        assert_eq!(sample_argmax(&[f32::NAN, 5.0, 6.0]), 0);
+        assert_eq!(sample_argmax(&[f32::NEG_INFINITY; 40]), 0);
     }
 
     #[test]
