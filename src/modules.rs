@@ -280,6 +280,10 @@ impl CausalAttentionBlock {
         })
     }
 
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -358,6 +362,10 @@ impl SwiGluBlock {
             norm: Norm::new(runtime, hidden)?,
             eps,
         })
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
     }
 
     pub fn record(

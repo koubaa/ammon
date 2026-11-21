@@ -642,14 +642,17 @@ fn rmsnorm_matches_cpu_reference_for_eps_and_width() {
     let unweighted = RmsnormUnweightedKernel::prepare(&device).unwrap();
     let weighted_ip = RmsnormInplaceKernel::prepare(&device).unwrap();
     let unweighted_ip = RmsnormUnweightedInplaceKernel::prepare(&device).unwrap();
-    let module = RmsNorm::with_eps(&device, 1.0e-6).unwrap();
+    // 0.1 is comparable to mean(x²) of these inputs, so ignoring eps fails the
+    // tolerance. 1e-6 versus the 1e-5 default does not.
+    let module = RmsNorm::with_eps(&device, 0.1).unwrap();
+    assert_eq!(module.eps(), 0.1);
     assert_eq!(RmsNorm::new(&device).unwrap().eps(), DEFAULT_RMS_EPS);
 
     for (dim, seed, eps) in [
         (1u32, 4u32, DEFAULT_RMS_EPS),
         (4, 1, DEFAULT_RMS_EPS),
         (7, 9, 1.0e-2),
-        (300, 2, 1.0e-6),
+        (300, 2, 0.1),
     ] {
         let x_host = cpu_ref::pseudo_random(dim as usize, seed);
         let w_host = cpu_ref::pseudo_random(dim as usize, seed + 17);
@@ -700,7 +703,7 @@ fn rmsnorm_matches_cpu_reference_for_eps_and_width() {
     }
 
     // Module records use the same kernels and the epsilon stored on the module.
-    let eps = 1.0e-6;
+    let eps = 0.1;
     let x_host = cpu_ref::pseudo_random(8, 21);
     let w_host = cpu_ref::pseudo_random(8, 22);
     let x = Tensor::from_f32(&device, TensorShape::vector(8), &x_host).unwrap();
@@ -849,7 +852,8 @@ fn rope_store_matches_cpu_reference() {
 fn causal_attention_block_matches_cpu_reference() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let eps = 1.0e-6;
+    // Large enough that a dropped eps (the 1e-5 default) misses the reference.
+    let eps = 0.1;
     let hidden = 8usize;
     let q_heads = 2usize;
     let kv_heads = 1usize;
@@ -858,6 +862,7 @@ fn causal_attention_block_matches_cpu_reference() {
     let kv_dim = kv_heads * head;
     let block =
         CausalAttentionBlock::with_eps(&device, hidden as u32, q_heads as u32, seq, eps).unwrap();
+    assert_eq!(block.eps(), eps);
     let cache = KvCache::new(&device, 1, seq, kv_heads as u32, head as u32).unwrap();
     let norm_h = cpu_ref::pseudo_random(hidden, 60);
     let wq_h = cpu_ref::pseudo_random(hidden * hidden, 61);
@@ -939,10 +944,11 @@ fn causal_attention_block_matches_cpu_reference() {
 fn swiglu_block_matches_cpu_reference() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let eps = 1.0e-6;
+    let eps = 0.1;
     let hidden = 8usize;
     let intermediate = 16usize;
     let block = SwiGluBlock::with_eps(&device, hidden as u32, intermediate as u32, eps).unwrap();
+    assert_eq!(block.eps(), eps);
     let x_host = cpu_ref::pseudo_random(hidden, 70);
     let norm_h = cpu_ref::pseudo_random(hidden, 71);
     let w1_h = cpu_ref::pseudo_random(intermediate * hidden, 72);

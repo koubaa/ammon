@@ -3,6 +3,9 @@
 //! The tensor-op RMSNorm path is selected only when that variable is `1`. This
 //! binary sets it for every test so the kernel-test process, which expects the
 //! kernel path, never observes the variable.
+//!
+//! Run with `--test-threads=1`. `AMMON_SEMANTIC_NORM` is process-global, and a
+//! parallel `cargo test --features vulkan` can race the kernel-path tests.
 
 #![cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 
@@ -47,7 +50,8 @@ fn read_f32(scheme: &mut Scheme, buf: &goldy::Buffer) -> Vec<f32> {
 fn fused_attention_block_norm_matches_cpu_reference() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let eps = 1.0e-6;
+    // 0.1 is large next to mean(x²), so a constructor that drops eps fails.
+    let eps = 0.1;
     let hidden = 8usize;
     let q_heads = 2usize;
     let kv_heads = 1usize;
@@ -56,6 +60,7 @@ fn fused_attention_block_norm_matches_cpu_reference() {
     let kv_dim = kv_heads * head;
     let block =
         CausalAttentionBlock::with_eps(&device, hidden as u32, q_heads as u32, seq, eps).unwrap();
+    assert_eq!(block.eps(), eps);
     let cache = KvCache::new(&device, 1, seq, kv_heads as u32, head as u32).unwrap();
     let norm_h = cpu_ref::pseudo_random(hidden, 80);
     let wq_h = cpu_ref::pseudo_random(hidden * hidden, 81);
@@ -142,6 +147,7 @@ fn fused_swiglu_block_matches_cpu_reference() {
     let hidden = 8usize;
     let intermediate = 12usize;
     let block = SwiGluBlock::with_eps(&device, hidden as u32, intermediate as u32, eps).unwrap();
+    assert_eq!(block.eps(), eps);
     let x_host = cpu_ref::pseudo_random(hidden, 90);
     let norm_h = cpu_ref::pseudo_random(hidden, 91);
     let w1_h = cpu_ref::pseudo_random(intermediate * hidden, 92);

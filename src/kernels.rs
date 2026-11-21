@@ -78,9 +78,11 @@ fn gemv(
     }
 }
 
-/// RMSNorm into `o` (one workgroup, strided over `x.len()`).
+/// RMSNorm into `o`.
 ///
-/// `o = weight * x * rsqrt(mean(x²) + eps)`.
+/// One workgroup of 256 lanes, strided over `x.len()`. Dispatch
+/// `groups([1, 1, 1])`. `o = weight * x * rsqrt(mean(x²) + eps)`.
+/// `record` takes `eps`; there is no defaulting overload.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rmsnorm(
     #[tensor(shape = [dim])] x: goldy::gpu::Tensor<f32>,
@@ -110,6 +112,9 @@ fn rmsnorm(
 }
 
 /// In-place RMSNorm on `x`: `x = weight * x * rsqrt(mean(x²) + eps)`.
+///
+/// Same single-workgroup dispatch as [`rmsnorm`]: `groups([1, 1, 1])`.
+/// `eps` is a required argument.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rmsnorm_inplace(
     #[tensor(shape = [dim])] x: goldy::gpu::TensorMut<f32>,
@@ -138,6 +143,8 @@ fn rmsnorm_inplace(
 }
 
 /// RMSNorm into `o` with no gain vector: `o = x * rsqrt(mean(x²) + eps)`.
+///
+/// One workgroup of 256 lanes. Dispatch `groups([1, 1, 1])`, not `over_1d`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rmsnorm_unweighted(
     #[tensor(shape = [dim])] x: goldy::gpu::Tensor<f32>,
