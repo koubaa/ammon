@@ -3,6 +3,8 @@
 //! Reductions run in f64. Callers compare the f32 rounding of that reference to
 //! the GPU result at atol 1e-5 and rtol 1e-4.
 
+#![allow(dead_code)]
+
 use ammon::kernels::DEFAULT_ROPE_THETA;
 
 pub fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
@@ -184,4 +186,150 @@ pub fn swiglu_block(
         .zip(y)
         .map(|(a, b)| (f64::from(*a) + f64::from(b)) as f32)
         .collect()
+}
+
+pub fn sigmoid(z: f64) -> f64 {
+    if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        let e = z.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// Per-head L2 clip. `x` and `scale` are `[heads, dim]` row-major.
+/// `alpha == 0` skips the log-position term. The norm epsilon is `1e-6`.
+pub fn head_l2_clip(
+    x: &[f32],
+    heads: usize,
+    dim: usize,
+    scale: Option<&[f32]>,
+    threshold: f32,
+    alpha: f32,
+    floor: f64,
+    pos: u32,
+) -> Vec<f32> {
+    let mut out = vec![0.0; heads * dim];
+    let mut log_mul = 1.0_f64;
+    if alpha != 0.0 {
+        let mut t = (f64::from(pos) + 1.0) / floor;
+        if t < 1.0 {
+            t = 1.0;
+        }
+        log_mul = 1.0 + f64::from(alpha) * t.ln();
+    }
+    for h in 0..heads {
+        let mut sumsq = 0.0_f64;
+        for j in 0..dim {
+            let mut v = f64::from(x[h * dim + j]);
+            if let Some(scale) = scale {
+                v *= f64::from(scale[h * dim + j]);
+            }
+            sumsq += v * v;
+        }
+        let mut factor = f64::from(threshold) / (sumsq.sqrt() + 1e-6);
+        if factor > 1.0 {
+            factor = 1.0;
+        }
+        factor *= log_mul;
+        for j in 0..dim {
+            let mut v = f64::from(x[h * dim + j]);
+            if let Some(scale) = scale {
+                v *= f64::from(scale[h * dim + j]);
+            }
+            out[h * dim + j] = (v * factor) as f32;
+        }
+    }
+    out
+}
+
+pub fn softcap(x: &[f32], cap: f64) -> Vec<f32> {
+    x.iter()
+        .map(|v| {
+            let z = f64::from(*v) / cap;
+            (cap * z.tanh()) as f32
+        })
+        .collect()
+}
+
+pub fn sigmoid_gate(values: &[f32], logits: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .zip(logits)
+        .map(|(v, z)| (f64::from(*v) * sigmoid(f64::from(*z))) as f32)
+        .collect()
+}
+
+pub fn softcapped_swiglu(gate: &[f32], up: &[f32], gate_cap: f64, up_cap: f64) -> Vec<f32> {
+    gate.iter()
+        .zip(up)
+        .map(|(g, u)| {
+            let g = f64::from(*g);
+            let u = f64::from(*u);
+            let capped_g = gate_cap * (g / gate_cap).tanh();
+            let capped_u = up_cap * (u / up_cap).tanh();
+            (capped_g * sigmoid(g) * capped_u) as f32
+        })
+        .collect()
+}
+
+/// Static conv1d step. `weight` and `state` are `[channels, kernel]`, oldest tap first.
+pub fn short_conv_step(
+    state: &mut [f32],
+    channels: usize,
+    kernel: usize,
+    x: &[f32],
+    weight: &[f32],
+) -> Vec<f32> {
+    let mut out = vec![0.0; channels];
+    for c in 0..channels {
+        let base = c * kernel;
+        let last = kernel - 1;
+        let mut acc = 0.0_f64;
+        for k in 0..last {
+            acc += f64::from(weight[base + k]) * f64::from(state[base + k + 1]);
+        }
+        let cur = f64::from(x[c]);
+        acc += f64::from(weight[base + last]) * cur;
+        for k in 0..last {
+            state[base + k] = state[base + k + 1];
+        }
+        state[base + last] = x[c];
+        out[c] = ((acc + cur) / ((kernel as f64) + 1.0).sqrt()) as f32;
+    }
+    out
+}
+
+/// Dynamic conv step. `static_weight` is `[kernel, channels]` with tap 0 on the
+/// current token. `taps` is `[heads, kernel]` in that order.
+pub fn dynamic_short_conv_step(
+    state: &mut [f32],
+    channels: usize,
+    heads: usize,
+    kernel: usize,
+    x: &[f32],
+    static_weight: &[f32],
+    taps: &[f32],
+) -> Vec<f32> {
+    let head_dim = channels / heads;
+    let mut out = vec![0.0; channels];
+    for c in 0..channels {
+        let head = c / head_dim;
+        let base = c * kernel;
+        let cur = f64::from(x[c]);
+        let mut acc = (f64::from(static_weight[c]) + f64::from(taps[head * kernel])) * cur;
+        for lag in 1..kernel {
+            let token = f64::from(state[base + kernel - lag]);
+            let w =
+                f64::from(static_weight[lag * channels + c]) + f64::from(taps[head * kernel + lag]);
+            acc += w * token;
+        }
+        let last = kernel - 1;
+        for k in 0..last {
+            state[base + k] = state[base + k + 1];
+        }
+        state[base + last] = x[c];
+        out[c] = ((acc + cur) / ((2.0 * kernel as f64) + 1.0).sqrt()) as f32;
+    }
+    out
 }

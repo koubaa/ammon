@@ -544,6 +544,10 @@ fn swiglu(
     hb[i] = val;
 }
 
+pub use crate::decode_ops::{
+    DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
+    SoftcappedSwiGluKernel, L2_CLIP_NORM_EPS,
+};
 pub use attention::Kernel as AttentionKernel;
 pub use attention_combine::Kernel as AttentionCombineKernel;
 pub use attention_partial::Kernel as AttentionPartialKernel;

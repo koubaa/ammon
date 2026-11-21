@@ -6,8 +6,8 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 
 ## What it owns
 
-- GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV
-- Recordable modules that own decode scratch where needed (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`)
+- GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV, per-head L2 clip, softcap, sigmoid gate, softcapped SwiGLU, one-token causal depthwise convolution
+- Recordable modules that own decode scratch where needed (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`, `ShortConv`, `DynamicShortConv`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`, `HeadL2Clip`, `Softcap`, `SigmoidGate`, `SoftcappedSwiGlu`)
 - Weight view structs (`CausalAttentionBlockWeights`, `SwiGluBlockWeights`); packed checkpoints stay in architecture crates
 - Prepared kernels cached per Goldy runtime (not part of the architecture-crate API)
 - Re-exported Goldy tensor kernels: residual `add` and semantic `matmul` (`TensorKernels`)
@@ -46,7 +46,7 @@ sudo apt-get install mesa-vulkan-drivers vulkan-tools
 # Pin the ICD when other Vulkan drivers are installed. DISPLAY may be unset.
 export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
 vulkaninfo --summary   # deviceName llvmpipe, apiVersion 1.4.*
-cargo test --features vulkan --lib --test kernels --test semantic_norm
+cargo test --features vulkan --lib --test kernels --test semantic_norm --test decode_ops
 ```
 
-Kernel and block results are compared to an f64 CPU reference at atol 1e-5 and rtol 1e-4. `semantic_norm` turns on `AMMON_SEMANTIC_NORM=1` with automatic fusion so the tensor-op RMSNorm path is what runs inside the pre-norm blocks. The first run compiles shaders through Slang; later runs reuse Goldy's on-disk shader cache. Lavapipe is CPU-bound, so `-- --test-threads=1` is the reliable way to run the suite.
+Kernel and block results are compared to an f64 CPU reference at atol 1e-5 and rtol 1e-4. `semantic_norm` turns on `AMMON_SEMANTIC_NORM=1` with automatic fusion so the tensor-op RMSNorm path is what runs inside the pre-norm blocks. `decode_ops` checks per-head L2 clip (optional scale and log-position scale), softcap, the sigmoid gate, softcapped SwiGLU, and static and dynamic short convolutions including reset. The first run compiles shaders through Slang; later runs reuse Goldy's on-disk shader cache. Lavapipe is CPU-bound, so `-- --test-threads=1` is the reliable way to run the suite.

@@ -3,6 +3,10 @@
 //! Modules record dispatches into a [`goldy::Scheme`]. Exchanges stay on the
 //! submitting root; these functions only bind retained parcels.
 
+use crate::decode_ops::{
+    DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
+    SoftcappedSwiGluKernel,
+};
 use crate::kernels::{
     AttentionCombineKernel, AttentionPartialKernel, CacheStoreKernel, EmbedKernel,
     RmsnormInplaceKernel, RmsnormKernel, RmsnormUnweightedInplaceKernel, RmsnormUnweightedKernel,
@@ -10,7 +14,7 @@ use crate::kernels::{
     DEFAULT_ROPE_THETA,
 };
 use anyhow::Context;
-use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorView};
+use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorScalar, TensorView};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
@@ -26,6 +30,12 @@ pub(crate) struct Blocks {
     tensors: TensorKernels,
     rmsnorm_unweighted: RmsnormUnweightedKernel,
     rmsnorm_unweighted_inplace: RmsnormUnweightedInplaceKernel,
+    head_l2_clip: HeadL2ClipKernel,
+    softcap: SoftcapKernel,
+    sigmoid_gate: SigmoidGateKernel,
+    softcapped_swiglu: SoftcappedSwiGluKernel,
+    short_conv: ShortConvKernel,
+    dynamic_short_conv: DynamicShortConvKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -109,6 +119,16 @@ impl Blocks {
                 .context("prepare rmsnorm_unweighted kernel")?,
             rmsnorm_unweighted_inplace: RmsnormUnweightedInplaceKernel::prepare(runtime)
                 .context("prepare rmsnorm_unweighted_inplace kernel")?,
+            head_l2_clip: HeadL2ClipKernel::prepare(runtime)
+                .context("prepare head_l2_clip kernel")?,
+            softcap: SoftcapKernel::prepare(runtime).context("prepare softcap kernel")?,
+            sigmoid_gate: SigmoidGateKernel::prepare(runtime)
+                .context("prepare sigmoid_gate kernel")?,
+            softcapped_swiglu: SoftcappedSwiGluKernel::prepare(runtime)
+                .context("prepare softcapped_swiglu kernel")?,
+            short_conv: ShortConvKernel::prepare(runtime).context("prepare short_conv kernel")?,
+            dynamic_short_conv: DynamicShortConvKernel::prepare(runtime)
+                .context("prepare dynamic_short_conv kernel")?,
         })
     }
 
@@ -375,6 +395,115 @@ impl Blocks {
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         self.tensors.matmul_into(scheme, label, weight, x, out)
+    }
+
+    pub(crate) fn record_head_l2_clip(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        scale: TensorView<'_>,
+        out: TensorView<'_>,
+        step: &Buffer,
+        threshold: f32,
+        alpha: f32,
+        floor: f32,
+        use_scale: u32,
+    ) -> Result<(), GoldyError> {
+        let heads = x.shape().dim(0)?;
+        self.head_l2_clip
+            .record(
+                scheme, "l2_clip", x, scale, out, step, threshold, alpha, floor, use_scale,
+            )?
+            .groups([heads.max(1), 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_softcap(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+        cap: f32,
+    ) -> Result<(), GoldyError> {
+        self.softcap
+            .record(scheme, "softcap", x, out, cap)?
+            .over_tensor(&x);
+        Ok(())
+    }
+
+    pub(crate) fn record_sigmoid_gate(
+        &self,
+        scheme: &mut Scheme,
+        values: TensorView<'_>,
+        logits: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.sigmoid_gate
+            .record(scheme, "sigmoid_gate", values, logits)?
+            .over_tensor(&values);
+        Ok(())
+    }
+
+    pub(crate) fn record_softcapped_swiglu(
+        &self,
+        scheme: &mut Scheme,
+        gate: TensorView<'_>,
+        up: TensorView<'_>,
+        out: TensorView<'_>,
+        gate_cap: f32,
+        up_cap: f32,
+    ) -> Result<(), GoldyError> {
+        self.softcapped_swiglu
+            .record(scheme, "softcapped_swiglu", gate, up, out, gate_cap, up_cap)?
+            .over_tensor(&gate);
+        Ok(())
+    }
+
+    pub(crate) fn record_short_conv(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        state: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.short_conv
+            .record(scheme, "short_conv", x, weight, state, out)?
+            .over_tensor(&x);
+        Ok(())
+    }
+
+    pub(crate) fn record_dynamic_short_conv(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        static_weight: TensorView<'_>,
+        taps: TensorView<'_>,
+        state: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.dynamic_short_conv
+            .record(
+                scheme,
+                "dynamic_short_conv",
+                x,
+                static_weight,
+                taps,
+                state,
+                out,
+            )?
+            .over_tensor(&x);
+        Ok(())
+    }
+
+    pub(crate) fn record_zero(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        tensor: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors
+            .recorder(scheme)
+            .fill(label, tensor, TensorScalar::F32(0.0))
     }
 }
 
