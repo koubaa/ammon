@@ -29,4 +29,16 @@ cargo test --offline
 cargo test --features cuda --test kernels
 ```
 
-On macOS, use `--features metal` in place of `cuda`.
+On macOS, use `--features metal` in place of `cuda`. On Linux, `--features vulkan` runs the same checks on Goldy's Vulkan backend (Vulkan 1.4+).
+
+Headless machines can use Mesa lavapipe, the llvmpipe software Vulkan driver. Mesa 25 or newer advertises Vulkan 1.4, which Goldy requires:
+
+```bash
+sudo apt-get install mesa-vulkan-drivers vulkan-tools
+# Pin the ICD when other Vulkan drivers are installed. DISPLAY may be unset.
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+vulkaninfo --summary   # deviceName llvmpipe, apiVersion 1.4.*
+cargo test --features vulkan --lib --test kernels --test semantic_norm
+```
+
+Kernel and block results are compared to an f64 CPU reference at atol 1e-5 and rtol 1e-4. `semantic_norm` turns on `AMMON_SEMANTIC_NORM=1` with automatic fusion so the tensor-op RMSNorm path is what runs inside the pre-norm blocks. The first run compiles shaders through Slang; later runs reuse Goldy's on-disk shader cache. Lavapipe is CPU-bound, so `-- --test-threads=1` is the reliable way to run the suite.

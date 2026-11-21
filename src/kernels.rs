@@ -7,6 +7,12 @@ pub const WORKGROUP: u32 = 256;
 /// Llama-2 / llama2.c default RoPE base frequency.
 pub const DEFAULT_ROPE_THETA: f32 = 10000.0;
 
+/// RMSNorm epsilon used by Llama-style callers.
+///
+/// `rsqrt(mean(x²) + eps)`. [`crate::RmsNorm::new`] and the pre-norm blocks keep
+/// this value; pass another epsilon to the `with_eps` constructors.
+pub const DEFAULT_RMS_EPS: f32 = 1e-5;
+
 /// Token and sequence position uploaded each decode step.
 #[goldy::gpu]
 pub struct DecodeStep {
@@ -73,11 +79,14 @@ fn gemv(
 }
 
 /// RMSNorm into `o` (one workgroup, strided over `x.len()`).
+///
+/// `o = weight * x * rsqrt(mean(x²) + eps)`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rmsnorm(
     #[tensor(shape = [dim])] x: goldy::gpu::Tensor<f32>,
     #[tensor(shape = [dim])] weight: goldy::gpu::Tensor<f32>,
     #[tensor(shape = [dim])] o: goldy::gpu::TensorWrite<f32>,
+    eps: f32,
 ) {
     let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
     let local = goldy::gpu::local_id().x;
@@ -91,7 +100,7 @@ fn rmsnorm(
     }
     ss = goldy::gpu::workgroup_sum::<256>(ss, scratch);
     ss = ss / (size as f32);
-    ss = ss + 1e-5;
+    ss = ss + eps;
     ss = 1.0 / goldy::gpu::sqrt(ss);
     j = local;
     while j < size {
@@ -100,11 +109,12 @@ fn rmsnorm(
     }
 }
 
-/// In-place RMSNorm on `x`.
+/// In-place RMSNorm on `x`: `x = weight * x * rsqrt(mean(x²) + eps)`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn rmsnorm_inplace(
     #[tensor(shape = [dim])] x: goldy::gpu::TensorMut<f32>,
     #[tensor(shape = [dim])] weight: goldy::gpu::Tensor<f32>,
+    eps: f32,
 ) {
     let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
     let local = goldy::gpu::local_id().x;
@@ -118,11 +128,63 @@ fn rmsnorm_inplace(
     }
     ss = goldy::gpu::workgroup_sum::<256>(ss, scratch);
     ss = ss / (size as f32);
-    ss = ss + 1e-5;
+    ss = ss + eps;
     ss = 1.0 / goldy::gpu::sqrt(ss);
     j = local;
     while j < size {
         x[j] = weight[j] * (ss * x[j]);
+        j = j + 256;
+    }
+}
+
+/// RMSNorm into `o` with no gain vector: `o = x * rsqrt(mean(x²) + eps)`.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn rmsnorm_unweighted(
+    #[tensor(shape = [dim])] x: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [dim])] o: goldy::gpu::TensorWrite<f32>,
+    eps: f32,
+) {
+    let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
+    let local = goldy::gpu::local_id().x;
+    let size = x.len();
+    let mut ss = 0.0;
+    let mut j = local;
+    while j < size {
+        let v = x[j];
+        ss = ss + v * v;
+        j = j + 256;
+    }
+    ss = goldy::gpu::workgroup_sum::<256>(ss, scratch);
+    ss = ss / (size as f32);
+    ss = ss + eps;
+    ss = 1.0 / goldy::gpu::sqrt(ss);
+    j = local;
+    while j < size {
+        o[j] = ss * x[j];
+        j = j + 256;
+    }
+}
+
+/// In-place RMSNorm on `x` with no gain vector.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn rmsnorm_unweighted_inplace(#[tensor(shape = [dim])] x: goldy::gpu::TensorMut<f32>, eps: f32) {
+    let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
+    let local = goldy::gpu::local_id().x;
+    let size = x.len();
+    let mut ss = 0.0;
+    let mut j = local;
+    while j < size {
+        let v = x[j];
+        ss = ss + v * v;
+        j = j + 256;
+    }
+    ss = goldy::gpu::workgroup_sum::<256>(ss, scratch);
+    ss = ss / (size as f32);
+    ss = ss + eps;
+    ss = 1.0 / goldy::gpu::sqrt(ss);
+    j = local;
+    while j < size {
+        x[j] = ss * x[j];
         j = j + 256;
     }
 }
@@ -483,6 +545,8 @@ pub use embed::Kernel as EmbedKernel;
 pub use gemv::Kernel as GemvKernel;
 pub use rmsnorm::Kernel as RmsnormKernel;
 pub use rmsnorm_inplace::Kernel as RmsnormInplaceKernel;
+pub use rmsnorm_unweighted::Kernel as RmsnormUnweightedKernel;
+pub use rmsnorm_unweighted_inplace::Kernel as RmsnormUnweightedInplaceKernel;
 pub use rope::Kernel as RopeKernel;
 pub use rope_store::Kernel as RopeStoreKernel;
 pub use swiglu::Kernel as SwigluKernel;

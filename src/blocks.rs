@@ -5,8 +5,9 @@
 
 use crate::kernels::{
     AttentionCombineKernel, AttentionPartialKernel, CacheStoreKernel, EmbedKernel,
-    RmsnormInplaceKernel, RmsnormKernel, RopeStoreKernel, SwigluKernel, TensorKernels,
-    ATTENTION_MAX_HEAD, ATTENTION_SPLIT, DEFAULT_ROPE_THETA,
+    RmsnormInplaceKernel, RmsnormKernel, RmsnormUnweightedInplaceKernel, RmsnormUnweightedKernel,
+    RopeStoreKernel, SwigluKernel, TensorKernels, ATTENTION_MAX_HEAD, ATTENTION_SPLIT,
+    DEFAULT_ROPE_THETA,
 };
 use anyhow::Context;
 use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorView};
@@ -23,6 +24,8 @@ pub(crate) struct Blocks {
     attention_combine: AttentionCombineKernel,
     swiglu: SwigluKernel,
     tensors: TensorKernels,
+    rmsnorm_unweighted: RmsnormUnweightedKernel,
+    rmsnorm_unweighted_inplace: RmsnormUnweightedInplaceKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -44,6 +47,7 @@ pub(crate) struct AttentionSites<'a> {
     pub wk: TensorView<'a>,
     pub wv: TensorView<'a>,
     pub wo: TensorView<'a>,
+    pub eps: f32,
 }
 
 /// Activation and weight views for one SwiGLU feed-forward block.
@@ -59,6 +63,7 @@ pub(crate) struct FfnSites<'a> {
     pub w1: TensorView<'a>,
     pub w2: TensorView<'a>,
     pub w3: TensorView<'a>,
+    pub eps: f32,
 }
 
 /// Scratch for RMSNorm recorded as tensor operations: the squares, `[dim]`, and
@@ -100,6 +105,10 @@ impl Blocks {
                 .context("prepare attention_combine kernel")?,
             swiglu: SwigluKernel::prepare(runtime).context("prepare swiglu kernel")?,
             tensors: TensorKernels::prepare(runtime).context("prepare tensor kernels")?,
+            rmsnorm_unweighted: RmsnormUnweightedKernel::prepare(runtime)
+                .context("prepare rmsnorm_unweighted kernel")?,
+            rmsnorm_unweighted_inplace: RmsnormUnweightedInplaceKernel::prepare(runtime)
+                .context("prepare rmsnorm_unweighted_inplace kernel")?,
         })
     }
 
@@ -121,30 +130,42 @@ impl Blocks {
     /// recorded as tensor operations, which fuse into the projections that read `out`.
     /// The mean square is then summed in order by one thread rather than across the
     /// kernel's 256 lanes, which is slower at every width Ammon runs.
+    ///
+    /// `weight` is the gain. `None` is the unweighted form (`out = x * rsqrt(mean(x²) + eps)`).
     fn norm(
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
-        weight: TensorView<'_>,
+        weight: Option<TensorView<'_>>,
         out: TensorView<'_>,
         scratch: NormScratch<'_>,
+        eps: f32,
     ) -> Result<(), GoldyError> {
         let semantic = std::env::var("AMMON_SEMANTIC_NORM").is_ok_and(|v| v == "1");
         if !(semantic && scheme.automatic_fusion()) {
-            self.rmsnorm
-                .record(scheme, "rmsnorm", x, weight, out)?
-                .groups([1, 1, 1]);
+            if let Some(weight) = weight {
+                self.rmsnorm
+                    .record(scheme, "rmsnorm", x, weight, out, eps)?
+                    .groups([1, 1, 1]);
+            } else {
+                self.rmsnorm_unweighted
+                    .record(scheme, "rmsnorm", x, out, eps)?
+                    .groups([1, 1, 1]);
+            }
             return Ok(());
         }
         let NormScratch { square, scale } = scratch;
         let mut rec = self.tensors.recorder(scheme);
         rec.mul_into("rms_square", x, x, square)?;
         rec.mean_into("rms_mean", square, 0, scale)?;
-        rec.add_scalar_into("rms_eps", scale, 1e-5, scale)?;
+        rec.add_scalar_into("rms_eps", scale, eps, scale)?;
         rec.sqrt_into("rms_sqrt", scale, scale)?;
         rec.reciprocal_into("rms_scale", scale, scale)?;
         rec.mul_into("rms_normalize", scale, x, out)?;
-        rec.mul_into("rms_weight", weight, out, out)
+        if let Some(weight) = weight {
+            rec.mul_into("rms_weight", weight, out, out)?;
+        }
+        Ok(())
     }
 
     /// `hb *= silu(hb) * hb2`. Under automatic fusion it is recorded as tensor
@@ -157,7 +178,9 @@ impl Blocks {
         gate: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         if !scheme.automatic_fusion() {
-            self.swiglu.record(scheme, "swiglu", hb, hb2)?.over_tensor(&hb);
+            self.swiglu
+                .record(scheme, "swiglu", hb, hb2)?
+                .over_tensor(&hb);
             return Ok(());
         }
         let mut rec = self.tensors.recorder(scheme);
@@ -216,7 +239,14 @@ impl Blocks {
         let proj = sites.xb2.narrow(0, 0, kv_dim)?;
         let v = sites.v.narrow(0, 0, kv_dim)?;
 
-        self.norm(scheme, sites.x, sites.rms, sites.xb, sites.norm)?;
+        self.norm(
+            scheme,
+            sites.x,
+            Some(sites.rms),
+            sites.xb,
+            sites.norm,
+            sites.eps,
+        )?;
         self.tensors
             .matmul_into(scheme, "wq", sites.wq, sites.xb, q_flat)?;
         self.tensors
@@ -264,7 +294,14 @@ impl Blocks {
         scheme: &mut Scheme,
         sites: FfnSites<'_>,
     ) -> Result<(), GoldyError> {
-        self.norm(scheme, sites.x, sites.rms, sites.xb, sites.norm)?;
+        self.norm(
+            scheme,
+            sites.x,
+            Some(sites.rms),
+            sites.xb,
+            sites.norm,
+            sites.eps,
+        )?;
         self.tensors
             .matmul_into(scheme, "w1", sites.w1, sites.xb, sites.hb)?;
         self.tensors
@@ -283,9 +320,10 @@ impl Blocks {
         x: TensorView<'_>,
         weight: TensorView<'_>,
         out: TensorView<'_>,
+        eps: f32,
     ) -> Result<(), GoldyError> {
         self.rmsnorm
-            .record(scheme, "rmsnorm", x, weight, out)?
+            .record(scheme, "rmsnorm", x, weight, out, eps)?
             .groups([1, 1, 1]);
         Ok(())
     }
@@ -295,9 +333,35 @@ impl Blocks {
         scheme: &mut Scheme,
         x: TensorView<'_>,
         weight: TensorView<'_>,
+        eps: f32,
     ) -> Result<(), GoldyError> {
         self.rmsnorm_inplace
-            .record(scheme, "rmsnorm", x, weight)?
+            .record(scheme, "rmsnorm", x, weight, eps)?
+            .groups([1, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_rmsnorm_unweighted(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+        eps: f32,
+    ) -> Result<(), GoldyError> {
+        self.rmsnorm_unweighted
+            .record(scheme, "rmsnorm", x, out, eps)?
+            .groups([1, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_rmsnorm_unweighted_inplace(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        eps: f32,
+    ) -> Result<(), GoldyError> {
+        self.rmsnorm_unweighted_inplace
+            .record(scheme, "rmsnorm", x, eps)?
             .groups([1, 1, 1]);
         Ok(())
     }
@@ -320,3 +384,76 @@ pub(crate) fn attention_splits(seq_len: u32) -> u32 {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Weak<Blocks>)>>> = OnceLock::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use goldy::{Tensor, TensorDType, TensorShape};
+
+    /// Clears `AMMON_SEMANTIC_NORM` on drop, including after a panic.
+    struct SemanticNormFlag;
+
+    impl SemanticNormFlag {
+        fn enable() -> Self {
+            // SAFETY: this lib test is the only writer, and the suite runs one test
+            // at a time (`--test-threads=1`) so nothing else is reading the environment.
+            unsafe { std::env::set_var("AMMON_SEMANTIC_NORM", "1") }
+            Self
+        }
+    }
+
+    impl Drop for SemanticNormFlag {
+        fn drop(&mut self) {
+            // SAFETY: same as `enable` — single-threaded test process.
+            unsafe { std::env::remove_var("AMMON_SEMANTIC_NORM") }
+        }
+    }
+
+    #[test]
+    fn semantic_unweighted_rmsnorm_uses_configured_eps() {
+        let _flag = SemanticNormFlag::enable();
+        let runtime = crate::gpu::create_runtime().expect("goldy runtime");
+        let ctx = runtime.create_context().unwrap();
+        let blocks = Blocks::prepare(&runtime).unwrap();
+        let eps = 1.0e-2_f32;
+        let x_host = [0.25_f32, -0.5, 0.75, 0.1];
+        let x = Tensor::from_f32(&runtime, TensorShape::vector(4), &x_host).unwrap();
+        let out = Tensor::zeros(&runtime, TensorShape::vector(4), TensorDType::F32).unwrap();
+        let square = Tensor::zeros(&runtime, TensorShape::vector(4), TensorDType::F32).unwrap();
+        let scale = Tensor::zeros(&runtime, TensorShape::vector(1), TensorDType::F32).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        scheme.set_automatic_fusion(true);
+        blocks
+            .norm(
+                &mut scheme,
+                x.view(),
+                None,
+                out.view(),
+                NormScratch {
+                    square: square.view(),
+                    scale: scale.view(),
+                },
+                eps,
+            )
+            .unwrap();
+        let mut sub = scheme.submit().unwrap();
+        let bytes = (&mut sub >> out.buffer()).take::<u8>().unwrap();
+        let got: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        let mean = x_host
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum::<f64>()
+            / x_host.len() as f64;
+        let inv = 1.0 / (mean + f64::from(eps)).sqrt();
+        for (i, v) in x_host.iter().enumerate() {
+            let want = (f64::from(*v) * inv) as f32;
+            let err = (got[i] - want).abs();
+            let tol = 1e-5 + 1e-4 * want.abs();
+            assert!(
+                err <= tol,
+                "unweighted semantic [{i}] = {}, reference {want}, err {err}",
+                got[i]
+            );
+        }
+    }
+}

@@ -96,6 +96,8 @@ impl Norm {
     }
 }
 
+pub use crate::kernels::DEFAULT_RMS_EPS;
+
 /// Token embedding table gather. No decode scratch.
 pub struct Embedding {
     blocks: Arc<Blocks>,
@@ -132,15 +134,30 @@ impl Embedding {
 }
 
 /// RMSNorm. Out-of-place writes `out`; [`Self::record_inplace`] overwrites `x`.
+///
+/// `out = weight * x * rsqrt(mean(x²) + eps)` with [`DEFAULT_RMS_EPS`] unless
+/// [`Self::with_eps`] says otherwise. [`Self::record_unweighted`] omits the gain.
+/// These records dispatch the RMSNorm kernel. Pre-norm blocks can lower the same
+/// formula as tensor ops when `AMMON_SEMANTIC_NORM=1` and the scheme fuses automatically.
 pub struct RmsNorm {
     blocks: Arc<Blocks>,
+    eps: f32,
 }
 
 impl RmsNorm {
     pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+        Self::with_eps(runtime, DEFAULT_RMS_EPS)
+    }
+
+    pub fn with_eps(runtime: &Runtime, eps: f32) -> anyhow::Result<Self> {
         Ok(Self {
             blocks: blocks(runtime)?,
+            eps,
         })
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
     }
 
     pub fn record(
@@ -150,7 +167,7 @@ impl RmsNorm {
         weight: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.blocks.record_rmsnorm(scheme, x, weight, out)
+        self.blocks.record_rmsnorm(scheme, x, weight, out, self.eps)
     }
 
     pub fn record_inplace(
@@ -159,7 +176,29 @@ impl RmsNorm {
         x: TensorView<'_>,
         weight: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.blocks.record_rmsnorm_inplace(scheme, x, weight)
+        self.blocks
+            .record_rmsnorm_inplace(scheme, x, weight, self.eps)
+    }
+
+    /// `out = x * rsqrt(mean(x²) + eps)`, with no gain vector.
+    pub fn record_unweighted(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks
+            .record_rmsnorm_unweighted(scheme, x, out, self.eps)
+    }
+
+    /// In-place form of [`Self::record_unweighted`].
+    pub fn record_unweighted_inplace(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks
+            .record_rmsnorm_unweighted_inplace(scheme, x, self.eps)
     }
 }
 
@@ -197,6 +236,7 @@ pub struct CausalAttentionBlock {
     v: Tensor,
     partial: Tensor,
     norm: Norm,
+    eps: f32,
 }
 
 impl CausalAttentionBlock {
@@ -205,6 +245,16 @@ impl CausalAttentionBlock {
         hidden: u32,
         query_heads: u32,
         seq_len: u32,
+    ) -> anyhow::Result<Self> {
+        Self::with_eps(runtime, hidden, query_heads, seq_len, DEFAULT_RMS_EPS)
+    }
+
+    pub fn with_eps(
+        runtime: &Runtime,
+        hidden: u32,
+        query_heads: u32,
+        seq_len: u32,
+        eps: f32,
     ) -> anyhow::Result<Self> {
         if query_heads == 0 || hidden % query_heads != 0 {
             anyhow::bail!("hidden {hidden} is not divisible by query_heads {query_heads}");
@@ -226,6 +276,7 @@ impl CausalAttentionBlock {
                 TensorDType::F32,
             )?,
             norm: Norm::new(runtime, hidden)?,
+            eps,
         })
     }
 
@@ -255,6 +306,7 @@ impl CausalAttentionBlock {
                 wk: weights.key,
                 wv: weights.value,
                 wo: weights.output,
+                eps: self.eps,
             },
         )
     }
@@ -283,10 +335,20 @@ pub struct SwiGluBlock {
     hb2: Tensor,
     gate: Tensor,
     norm: Norm,
+    eps: f32,
 }
 
 impl SwiGluBlock {
     pub fn new(runtime: &Runtime, hidden: u32, intermediate: u32) -> anyhow::Result<Self> {
+        Self::with_eps(runtime, hidden, intermediate, DEFAULT_RMS_EPS)
+    }
+
+    pub fn with_eps(
+        runtime: &Runtime,
+        hidden: u32,
+        intermediate: u32,
+        eps: f32,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             blocks: blocks(runtime)?,
             xb: Tensor::zeros(runtime, TensorShape::vector(hidden), TensorDType::F32)?,
@@ -294,6 +356,7 @@ impl SwiGluBlock {
             hb2: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,
             gate: Tensor::zeros(runtime, TensorShape::vector(intermediate), TensorDType::F32)?,
             norm: Norm::new(runtime, hidden)?,
+            eps,
         })
     }
 
@@ -316,6 +379,7 @@ impl SwiGluBlock {
                 w1: weights.gate,
                 w2: weights.down,
                 w3: weights.up,
+                eps: self.eps,
             },
         )
     }
