@@ -11,13 +11,13 @@ use crate::decode_ops::{
     DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
     SoftcappedSwiGluKernel,
 };
+use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::kernels::{
     AttentionCombineKernel, AttentionPartialKernel, CacheStoreKernel, EmbedKernel,
     RmsnormInplaceKernel, RmsnormKernel, RmsnormUnweightedInplaceKernel, RmsnormUnweightedKernel,
     RopeStoreKernel, SwigluKernel, TensorKernels, ATTENTION_MAX_HEAD, ATTENTION_SPLIT,
     DEFAULT_ROPE_THETA,
 };
-use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::moe::{MoeDownAccumKernel, MoeGateUpKernel, MoeTopkKernel};
 use anyhow::Context;
 use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorScalar, TensorView};
@@ -159,7 +159,8 @@ impl Blocks {
             moe_gate_up: MoeGateUpKernel::prepare(runtime).context("prepare moe_gate_up kernel")?,
             moe_down_accum: MoeDownAccumKernel::prepare(runtime)
                 .context("prepare moe_down_accum kernel")?,
-            depth_store: DepthStoreKernel::prepare(runtime).context("prepare depth_store kernel")?,
+            depth_store: DepthStoreKernel::prepare(runtime)
+                .context("prepare depth_store kernel")?,
             depth_copy_rows: DepthCopyRowsKernel::prepare(runtime)
                 .context("prepare depth_copy_rows kernel")?,
             depth_mix: DepthMixKernel::prepare(runtime).context("prepare depth_mix kernel")?,

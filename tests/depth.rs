@@ -54,7 +54,12 @@ fn tensor(device: &goldy::Runtime, dims: &[u32], data: &[f32]) -> Tensor {
 }
 
 fn zeros(device: &goldy::Runtime, dims: &[u32]) -> Tensor {
-    Tensor::zeros(device, TensorShape::from_dims(dims).unwrap(), TensorDType::F32).unwrap()
+    Tensor::zeros(
+        device,
+        TensorShape::from_dims(dims).unwrap(),
+        TensorDType::F32,
+    )
+    .unwrap()
 }
 
 fn write(buf: &Tensor, data: &[f32]) {
@@ -65,7 +70,10 @@ fn write(buf: &Tensor, data: &[f32]) {
 fn depth_schedule_matches_pinned_modules_on_replay() {
     let device = create_runtime().expect("goldy runtime");
     let ctx = device.create_context().unwrap();
-    let mut reader = Reader { data: GOLDEN, at: 0 };
+    let mut reader = Reader {
+        data: GOLDEN,
+        at: 0,
+    };
     assert_eq!(reader.u32(), 0x4854_5044);
     assert_eq!(reader.u32(), 1);
     let n_plans = reader.u32();
@@ -87,8 +95,20 @@ fn depth_schedule_matches_pinned_modules_on_replay() {
         if layers == 24 {
             let mini = DepthPlan::mini();
             assert_eq!(
-                (plan.layers, plan.block, plan.loop_start, plan.loop_end, plan.passes),
-                (mini.layers, mini.block, mini.loop_start, mini.loop_end, mini.passes)
+                (
+                    plan.layers,
+                    plan.block,
+                    plan.loop_start,
+                    plan.loop_end,
+                    plan.passes
+                ),
+                (
+                    mini.layers,
+                    mini.block,
+                    mini.loop_start,
+                    mini.loop_end,
+                    mini.passes
+                )
             );
         }
         let visits = plan.visits();
@@ -173,10 +193,7 @@ fn depth_schedule_matches_pinned_modules_on_replay() {
                 .max(max_abs(&got_msg[..token.6.len()], &token.6))
                 .max(max_abs(&got_final, &token.7))
                 .max(max_abs(&got_tape[..token.8.len()], &token.8));
-            assert!(
-                err <= 1e-5,
-                "plan {layers} token {t} max abs {err}"
-            );
+            assert!(err <= 1e-5, "plan {layers} token {t} max abs {err}");
         }
         for _ in 0..12 {
             if recorded.replay_stats().clean_submits > 0 {

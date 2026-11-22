@@ -1562,7 +1562,9 @@ impl DepthPlan {
     }
 
     pub fn n_full(self) -> u32 {
-        (0..self.layers).filter(|layer| self.is_full(*layer)).count() as u32
+        (0..self.layers)
+            .filter(|layer| self.is_full(*layer))
+            .count() as u32
     }
 
     pub fn full_index(self, layer: u32) -> u32 {
@@ -1589,7 +1591,9 @@ impl DepthPlan {
             anyhow::bail!("depth plan needs layers, a block size, and at least one pass");
         }
         if self.loop_start == 0 || self.loop_start >= self.loop_end || self.loop_end > self.layers {
-            anyhow::bail!("depth loop range must sit inside the layer stack and start after layer 0");
+            anyhow::bail!(
+                "depth loop range must sit inside the layer stack and start after layer 0"
+            );
         }
         if self.loop_start % self.block != 0 || self.loop_end % self.block != 0 {
             anyhow::bail!("depth loop ends must be multiples of the block size");
@@ -1616,7 +1620,10 @@ pub struct DepthRunner {
 impl DepthRunner {
     pub fn new(runtime: &Runtime, hidden: u32, capacity: u32) -> anyhow::Result<Self> {
         if hidden == 0 || capacity == 0 || capacity + 1 > crate::depth::DEPTH_MAX_KEYS {
-            anyhow::bail!("depth tape capacity must be in 1..={}", crate::depth::DEPTH_MAX_KEYS - 1);
+            anyhow::bail!(
+                "depth tape capacity must be in 1..={}",
+                crate::depth::DEPTH_MAX_KEYS - 1
+            );
         }
         let shape = TensorShape::matrix(capacity, hidden);
         let f = TensorDType::F32;
@@ -1686,14 +1693,25 @@ impl DepthRunner {
             self.expect(&[n_msg, 4, hidden], msg_out, "message out")?;
         }
         self.expect(&[hidden], final_out, "final out")?;
-        self.blocks.record_zero(scheme, "depth_attn_out", attn_out)?;
+        self.blocks
+            .record_zero(scheme, "depth_attn_out", attn_out)?;
         self.blocks.record_zero(scheme, "depth_msg_out", msg_out)?;
 
         let mut len = 0u32;
         for layer in 0..plan.loop_start {
             self.record_layer(
-                scheme, plan, 0, layer, &mut len, entries, mlp_partial, q_single, q_full, q_mlp,
-                attn_out, mlp_out,
+                scheme,
+                plan,
+                0,
+                layer,
+                &mut len,
+                entries,
+                mlp_partial,
+                q_single,
+                q_full,
+                q_mlp,
+                attn_out,
+                mlp_out,
             )?;
         }
         let snap_len = len;
@@ -1740,15 +1758,35 @@ impl DepthRunner {
             }
             for layer in plan.loop_start..plan.loop_end {
                 self.record_layer(
-                    scheme, plan, pass, layer, &mut len, entries, mlp_partial, q_single, q_full,
-                    q_mlp, attn_out, mlp_out,
+                    scheme,
+                    plan,
+                    pass,
+                    layer,
+                    &mut len,
+                    entries,
+                    mlp_partial,
+                    q_single,
+                    q_full,
+                    q_mlp,
+                    attn_out,
+                    mlp_out,
                 )?;
             }
         }
         for layer in plan.loop_end..plan.layers {
             self.record_layer(
-                scheme, plan, 0, layer, &mut len, entries, mlp_partial, q_single, q_full, q_mlp,
-                attn_out, mlp_out,
+                scheme,
+                plan,
+                0,
+                layer,
+                &mut len,
+                entries,
+                mlp_partial,
+                q_single,
+                q_full,
+                q_mlp,
+                attn_out,
+                mlp_out,
             )?;
         }
         let q_final = q_final.reshape(&[1, hidden])?;

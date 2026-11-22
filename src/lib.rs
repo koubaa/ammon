@@ -25,9 +25,9 @@ mod moe;
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
     DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DepthPlan, DepthRunner,
-    DynamicShortConv,
-    Embedding, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv,
-    SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
+    DynamicShortConv, Embedding, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm,
+    ShortConv, SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights,
+    DEFAULT_RMS_EPS,
 };
 
 pub use generate::{
