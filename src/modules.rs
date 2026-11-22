@@ -499,7 +499,7 @@ impl HeadL2Clip {
     }
 }
 
-/// `out = cap * tanh(x / cap)`.
+/// `out = cap * tanh(x / cap)`, using `goldy::gpu::tanh`.
 pub struct Softcap {
     blocks: Arc<Blocks>,
     cap: f32,
@@ -530,7 +530,7 @@ impl Softcap {
     }
 }
 
-/// In-place `values *= sigmoid(logits)`.
+/// In-place `values *= sigmoid(logits)`, using `goldy::gpu::sigmoid`.
 pub struct SigmoidGate {
     blocks: Arc<Blocks>,
 }
@@ -559,7 +559,8 @@ impl SigmoidGate {
 
 /// `out = softcap(gate) * sigmoid(gate) * softcap(up)`.
 ///
-/// `sigmoid` sees the raw gate. `gate_cap` bounds only the linear gate factor.
+/// `sigmoid` sees the raw gate and is `goldy::gpu::sigmoid`. `gate_cap` bounds
+/// only the linear gate factor. Both caps use `goldy::gpu::tanh`.
 pub struct SoftcappedSwiGlu {
     blocks: Arc<Blocks>,
     gate_cap: f32,

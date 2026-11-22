@@ -138,8 +138,8 @@ fn softcap_and_sigmoid_gate_match_cpu_reference() {
     );
     cpu_ref::assert_close("softcap", &read_f32(&mut scheme, out.buffer()), &want);
 
-    // Inkling softcap widths, including the near-zero region where the exp form
-    // of tanh cancels. The reference is libm tanh via cpu_ref, not the kernel series.
+    // Inkling softcap widths, including |x| <= 0.3 at caps 25 and 30.
+    // The reference is libm tanh via cpu_ref.
     for cap in [25.0_f64, 30.0] {
         let x_host: Vec<f32> = (0..1001).map(|i| (i as f32 / 1000.0) * 0.6 - 0.3).collect();
         let x = vector(&device, &x_host);
