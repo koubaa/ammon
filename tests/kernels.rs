@@ -591,6 +591,15 @@ fn split_attention_matches_reference_for_gqa_and_head_widths() {
             seq: 2112,
             positions: &[2047, 2111],
         },
+        // First bounded split (visible 257, per = 9, trailing splits empty),
+        // then longer chunks.
+        AttentionCase {
+            q_heads: 2,
+            kv_heads: 2,
+            head: 32,
+            seq: 1000,
+            positions: &[256, 299, 999],
+        },
     ] {
         assert_split_attention_matches_reference(case);
     }

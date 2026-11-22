@@ -450,14 +450,12 @@ fn attention_partial(
                 chunk_l = chunk_l + probs[j];
             }
             l_run = l_run * rescale + chunk_l;
-            lanes[0] = m_new;
-            lanes[1] = l_run;
         }
-        goldy::gpu::workgroup_barrier();
-        m_run = lanes[0];
-        l_run = lanes[1];
+        // Every thread already computed the same m_new. l_run stays on thread 0,
+        // which is the only thread that stores it. Writing those stats back
+        // through `lanes` raced with the fold above.
+        m_run = m_new;
         started = 1u32;
-        goldy::gpu::workgroup_barrier();
         offset = offset + n;
     }
     let out = (h * splits + split) * partial.dim(2);

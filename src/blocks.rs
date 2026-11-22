@@ -18,7 +18,7 @@ use crate::kernels::{
     RopeStoreKernel, SwigluKernel, TensorKernels, ATTENTION_MAX_HEAD, ATTENTION_MAX_SPLITS,
     ATTENTION_SPLIT, DEFAULT_ROPE_THETA,
 };
-use crate::moe::{MoeDownAccumKernel, MoeGateUpKernel, MoeTopkKernel};
+use crate::moe::MoeTopkKernel;
 use anyhow::Context;
 use goldy::{
     Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorScalar, TensorShape, TensorView,
@@ -56,8 +56,6 @@ pub(crate) struct Blocks {
     relative_attention_partial: RelativeAttentionPartialKernel,
     relative_attention_combine: RelativeAttentionCombineKernel,
     moe_topk: MoeTopkKernel,
-    moe_gate_up: MoeGateUpKernel,
-    moe_down_accum: MoeDownAccumKernel,
     depth_store: DepthStoreKernel,
     depth_copy_rows: DepthCopyRowsKernel,
     depth_mix: DepthMixKernel,
@@ -169,9 +167,6 @@ impl Blocks {
             relative_attention_combine: RelativeAttentionCombineKernel::prepare(runtime)
                 .context("prepare relative_attention_combine kernel")?,
             moe_topk: MoeTopkKernel::prepare(runtime).context("prepare moe_topk kernel")?,
-            moe_gate_up: MoeGateUpKernel::prepare(runtime).context("prepare moe_gate_up kernel")?,
-            moe_down_accum: MoeDownAccumKernel::prepare(runtime)
-                .context("prepare moe_down_accum kernel")?,
             depth_store: DepthStoreKernel::prepare(runtime)
                 .context("prepare depth_store kernel")?,
             depth_copy_rows: DepthCopyRowsKernel::prepare(runtime)
@@ -505,18 +500,14 @@ impl Blocks {
         out: TensorView<'_>,
         cap: f32,
     ) -> Result<(), GoldyError> {
-        let mut rec = self.tensors.recorder(scheme);
-        // `tanh(x / 1) * 1` is `tanh(x)`. One op keeps a message gate inside the
-        // 16-resource fusion limit.
-        if cap == 1.0 {
-            rec.tanh_into("softcap", x, out)?;
-            return Ok(());
+        // `cap == 1` is one tanh. Goldy owns that identity.
+        let kept = self
+            .tensors
+            .recorder(scheme)
+            .tanh_scaled_into("softcap", x, cap, out)?;
+        for tensor in kept {
+            self.keep(tensor);
         }
-        let scaled = rec.div_scalar("softcap_div", x, cap)?;
-        let curved = rec.tanh("softcap_tanh", scaled.view())?;
-        rec.mul_scalar_into("softcap", curved.view(), cap, out)?;
-        self.keep(scaled);
-        self.keep(curved);
         Ok(())
     }
 
@@ -658,12 +649,9 @@ impl Blocks {
         slot: u32,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        let slab = self
-            .tensors
+        self.tensors
             .recorder(scheme)
-            .matmul_indexed_into(label, weight, x, ids, slot, out)?;
-        self.keep(slab);
-        Ok(())
+            .matmul_indexed_into(label, weight, x, ids, slot, out)
     }
 
     fn vector(&self, len: u32) -> Result<Tensor, GoldyError> {
@@ -822,49 +810,6 @@ impl Blocks {
         self.moe_topk
             .record(scheme, "moe_topk", logits, bias, ids, weights, route_scale)?
             .groups([1, 1, 1]);
-        Ok(())
-    }
-
-    #[allow(dead_code)] // indexed matmul replaced the call; kept until the kernel is deleted
-    pub(crate) fn record_moe_gate_up(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        gate_up: TensorView<'_>,
-        ids: TensorView<'_>,
-        gate: TensorView<'_>,
-        up: TensorView<'_>,
-        slot: u32,
-    ) -> Result<(), GoldyError> {
-        self.moe_gate_up
-            .record(scheme, "moe_gate_up", x, gate_up, ids, gate, up, slot)?
-            .over_tensor(&gate);
-        Ok(())
-    }
-
-    #[allow(dead_code)] // indexed matmul replaced the call; kept until the kernel is deleted
-    pub(crate) fn record_moe_down_accum(
-        &self,
-        scheme: &mut Scheme,
-        activated: TensorView<'_>,
-        down: TensorView<'_>,
-        ids: TensorView<'_>,
-        weights: TensorView<'_>,
-        out: TensorView<'_>,
-        slot: u32,
-    ) -> Result<(), GoldyError> {
-        self.moe_down_accum
-            .record(
-                scheme,
-                "moe_down_accum",
-                activated,
-                down,
-                ids,
-                weights,
-                out,
-                slot,
-            )?
-            .over_tensor(&out);
         Ok(())
     }
 

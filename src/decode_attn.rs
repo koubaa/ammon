@@ -364,14 +364,10 @@ fn relative_attention_partial(
                 chunk_l = chunk_l + probs[j];
             }
             l_run = l_run * rescale + chunk_l;
-            lanes[0] = m_new;
-            lanes[1] = l_run;
         }
-        goldy::gpu::workgroup_barrier();
-        m_run = lanes[0];
-        l_run = lanes[1];
+        // Same m_new on every thread. l_run stays on thread 0, which stores it.
+        m_run = m_new;
         started = 1u32;
-        goldy::gpu::workgroup_barrier();
         offset = offset + count;
     }
     let out = (h * splits + split) * partial.dim(2);
