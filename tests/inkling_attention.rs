@@ -14,7 +14,7 @@ use ammon::kernels::DecodeStep;
 use ammon::{
     DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights, DecodeKvCache, LogPositionScale,
 };
-use goldy::{BufferKind, Runtime, Scheme, Tensor, TensorDType, TensorShape};
+use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
 fn runtime() -> Runtime {
     create_runtime().expect("goldy runtime")
@@ -146,7 +146,6 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
             weights,
             &cache,
             &step,
-            i as u32,
             out.view(),
         )
         .unwrap();
@@ -432,7 +431,7 @@ fn mini_head_counts_construct() {
 }
 
 #[test]
-fn full_cache_rejects_a_position_past_capacity() {
+fn full_cache_replay_past_capacity_does_not_write() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
     let attn = DecodeAttention::new(
@@ -454,45 +453,84 @@ fn full_cache_rejects_a_position_past_capacity() {
     .unwrap();
     let cache =
         DecodeKvCache::new(&device, DecodeAttentionKind::Full { capacity: 2 }, 2, 4).unwrap();
-    let z = Tensor::zeros(&device, TensorShape::vector(4), TensorDType::F32).unwrap();
+    let err = cache.check_position(2).unwrap_err();
+    assert!(err.to_string().contains("outside capacity"), "{err}");
+    cache.check_position(1).unwrap();
+
+    let hidden = Tensor::from_f32(&device, TensorShape::vector(4), &[1.0, 0.0, 0.0, 0.0]).unwrap();
     let wq = Tensor::zeros(&device, TensorShape::matrix(8, 4), TensorDType::F32).unwrap();
-    let wk = Tensor::zeros(&device, TensorShape::matrix(8, 4), TensorDType::F32).unwrap();
+    let mut wk_host = vec![0.0_f32; 8 * 4];
+    for row in 0..8 {
+        wk_host[row * 4] = 1.0;
+    }
+    let wk = Tensor::from_f32(&device, TensorShape::matrix(8, 4), &wk_host).unwrap();
     let wo = Tensor::zeros(&device, TensorShape::matrix(4, 8), TensorDType::F32).unwrap();
     let wrel = Tensor::zeros(&device, TensorShape::matrix(4, 4), TensorDType::F32).unwrap();
     let rel_proj = Tensor::zeros(&device, TensorShape::matrix(2, 2), TensorDType::F32).unwrap();
-    let q_scale = Tensor::zeros(&device, TensorShape::matrix(2, 4), TensorDType::F32).unwrap();
-    let rel_scale = Tensor::zeros(&device, TensorShape::matrix(2, 2), TensorDType::F32).unwrap();
+    let q_scale = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(2, 4),
+        &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    )
+    .unwrap();
+    let rel_scale =
+        Tensor::from_f32(&device, TensorShape::matrix(2, 2), &[1.0, 1.0, 1.0, 1.0]).unwrap();
     let wsink = Tensor::zeros(&device, TensorShape::matrix(2, 4), TensorDType::F32).unwrap();
     let k_conv = Tensor::zeros(&device, TensorShape::matrix(8, 2), TensorDType::F32).unwrap();
-    let step = step_buf(&device, 2);
-    let mut scheme = Scheme::new(&ctx);
-    let err = attn
-        .record(
-            &mut scheme,
-            z.view(),
-            z.view(),
-            z.view(),
-            DecodeAttentionWeights {
-                wq: wq.view(),
-                wk: wk.view(),
-                wv: wk.view(),
-                wo: wo.view(),
-                wgate: wq.view(),
-                wsink: wsink.view(),
-                wrel: wrel.view(),
-                rel_proj: rel_proj.view(),
-                q_scale: q_scale.view(),
-                rel_scale: rel_scale.view(),
-                k_conv: k_conv.view(),
-                v_conv: k_conv.view(),
-                k_conv_proj: None,
-                v_conv_proj: None,
-            },
-            &cache,
-            &step,
-            2,
-            z.view(),
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("outside capacity"), "{err}");
+    let out = Tensor::zeros(&device, TensorShape::vector(4), TensorDType::F32).unwrap();
+    let step = step_buf(&device, 0);
+    let weights = DecodeAttentionWeights {
+        wq: wq.view(),
+        wk: wk.view(),
+        wv: wk.view(),
+        wo: wo.view(),
+        wgate: wq.view(),
+        wsink: wsink.view(),
+        wrel: wrel.view(),
+        rel_proj: rel_proj.view(),
+        q_scale: q_scale.view(),
+        rel_scale: rel_scale.view(),
+        k_conv: k_conv.view(),
+        v_conv: k_conv.view(),
+        k_conv_proj: None,
+        v_conv_proj: None,
+    };
+    let mut recorded = Scheme::new(&ctx);
+    attn.record(
+        &mut recorded,
+        hidden.view(),
+        hidden.view(),
+        hidden.view(),
+        weights,
+        &cache,
+        &step,
+        out.view(),
+    )
+    .unwrap();
+    let _ = recorded.submit().unwrap();
+    let mut read = Scheme::new(&ctx);
+    let after_zero = read_f32(&mut read, cache.keys().buffer());
+    assert!(after_zero.iter().any(|v| *v != 0.0), "{after_zero:?}");
+
+    let mut upload = Scheme::new(&ctx);
+    let deposit = MemoryExchange::new(&ctx)
+        .bind_deposit(&mut upload, DecodeStep::deposit_target(&step))
+        .unwrap();
+    for position in [5u32, 1u32] {
+        deposit
+            .write_data(0, &[DecodeStep { token: 0, position }])
+            .unwrap();
+        let _ = upload.submit().unwrap();
+        let _ = recorded.submit().unwrap();
+        let mut read = Scheme::new(&ctx);
+        let got = read_f32(&mut read, cache.keys().buffer());
+        if position == 5 {
+            assert_eq!(got, after_zero, "a replay past capacity must not store");
+        } else {
+            assert_ne!(
+                got, after_zero,
+                "position 1 is inside the cache and must store"
+            );
+        }
+    }
 }

@@ -813,6 +813,30 @@ impl DecodeKvCache {
         self.blocks
             .record_zero(scheme, "kv_reset_v", self.value.view())
     }
+
+    pub fn keys(&self) -> TensorView<'_> {
+        self.key.view()
+    }
+
+    pub fn values(&self) -> TensorView<'_> {
+        self.value.view()
+    }
+
+    /// Host check for the position about to be deposited into `DecodeStep`.
+    ///
+    /// `record` runs once and cannot see later deposits. A full cache position
+    /// must be `< capacity`. The kernels also refuse to index past the
+    /// allocation if a replayed step violates that.
+    pub fn check_position(&self, position: u32) -> Result<(), GoldyError> {
+        if let DecodeAttentionKind::Full { capacity } = self.kind {
+            if position >= capacity {
+                return Err(GoldyError::Validation(format!(
+                    "full KV position {position} is outside capacity {capacity}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Weights for one [`DecodeAttention`] step. Layout matches the bias-free
@@ -860,8 +884,9 @@ enum KvConv {
 /// norm is unweighted RMSNorm over each head, with `rms_eps`. Head size is at
 /// most 128.
 ///
-/// `position` must be the value stored in `step`. A full cache rejects
-/// `position >= capacity` here, before the kernel indexes the prefix.
+/// The position lives in `step`. Call [`DecodeKvCache::check_position`] where
+/// that step is deposited. A full cache that is replayed past its capacity
+/// does not read or write outside the allocation.
 pub struct DecodeAttention {
     blocks: Arc<Blocks>,
     linear: Linear,
@@ -1015,7 +1040,6 @@ impl DecodeAttention {
         weights: DecodeAttentionWeights<'_>,
         cache: &DecodeKvCache,
         step: &Buffer,
-        position: u32,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         if cache.kind != self.kind
@@ -1050,14 +1074,7 @@ impl DecodeAttention {
         self.expect_matrix("rel_scale", weights.rel_scale, self.q_heads, self.d_rel)?;
         let window = match self.kind {
             DecodeAttentionKind::Sliding { window } => window,
-            DecodeAttentionKind::Full { capacity } => {
-                if position >= capacity {
-                    return Err(GoldyError::Validation(format!(
-                        "full attention position {position} is outside capacity {capacity}"
-                    )));
-                }
-                0
-            }
+            DecodeAttentionKind::Full { .. } => 0,
         };
 
         let q_flat = self.q.view().reshape(&[q_dim])?;

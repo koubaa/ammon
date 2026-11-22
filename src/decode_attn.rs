@@ -10,10 +10,28 @@
 
 use crate::kernels::DecodeStep;
 
+/// Cache slot for a logical position.
+///
+/// Ring mode (`window != 0`) is `logical % capacity`, so the allocation can be
+/// wider than the window. Full mode is the position itself, and positions at
+/// or past `capacity` are not a slot. The shaders inline this; a device
+/// function call is not available in `#[goldy::compute]`.
+#[allow(dead_code)]
+fn cache_slot(logical: u32, window: u32, capacity: u32) -> Option<u32> {
+    if window != 0 {
+        Some(logical % capacity)
+    } else if logical < capacity {
+        Some(logical)
+    } else {
+        None
+    }
+}
+
 /// Write the current key and value into the cache slot for `step.position`.
 ///
-/// `window == 0` stores at the absolute position (full cache). Otherwise the
-/// cache length is the window and the slot is `position % window`.
+/// `window == 0` stores at the absolute position (full cache) and leaves the
+/// cache untouched when that position is past the allocation. Otherwise the
+/// slot is `position % capacity`.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn kv_cache_store(
     #[tensor(shape = [kv_heads, head])] k: goldy::gpu::Tensor<f32>,
@@ -29,9 +47,13 @@ fn kv_cache_store(
         return;
     }
     let pos = step[0].position;
+    let capacity = key_cache.dim(0);
+    // Same rule as `cache_slot`. Inlined because a shader body cannot call it.
     let mut slot = pos;
     if window != 0 {
-        slot = pos % key_cache.dim(0);
+        slot = pos % capacity;
+    } else if slot >= capacity {
+        return;
     }
     let dst = slot * row + i;
     key_cache[dst] = k[i];
@@ -76,6 +98,10 @@ fn relative_attention(
             start = pos + 1 - window;
             n = window;
         }
+    } else if n > capacity {
+        // A replayed step can name a position past the allocation. Attend only
+        // the keys that exist; do not index the cache with `pos`.
+        n = capacity;
     }
 
     if local < head {
@@ -145,3 +171,16 @@ fn relative_attention(
 
 pub use kv_cache_store::Kernel as KvCacheStoreKernel;
 pub use relative_attention::Kernel as RelativeAttentionKernel;
+
+#[cfg(test)]
+mod tests {
+    use super::cache_slot;
+
+    #[test]
+    fn cache_slot_is_modulo_for_a_ring_and_bounded_for_a_full_cache() {
+        assert_eq!(cache_slot(5, 4, 4), Some(1));
+        assert_eq!(cache_slot(5, 4, 8), Some(5));
+        assert_eq!(cache_slot(1, 0, 2), Some(1));
+        assert_eq!(cache_slot(2, 0, 2), None);
+    }
+}
