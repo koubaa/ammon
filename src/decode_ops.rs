@@ -201,8 +201,29 @@ fn dynamic_short_conv(
     out[c] = (acc + cur) / goldy::gpu::sqrt((2.0 * (kernel as f32)) + 1.0);
 }
 
+/// `(1 - forget) * hidden + gate * message`.
+///
+/// `forget` and `gate` are tanh of the low-rank projections. The hidden state
+/// and the message are not normalized here; the caller norms them only to form
+/// the gate input.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn message_mix(
+    #[tensor(shape = [hidden])] hidden: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [hidden])] message: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [hidden])] forget: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [hidden])] gate: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [hidden])] out: goldy::gpu::TensorWrite<f32>,
+) {
+    let i = goldy::gpu::global_id().x;
+    if i >= hidden.len() {
+        return;
+    }
+    out[i] = (1.0 - forget[i]) * hidden[i] + gate[i] * message[i];
+}
+
 pub use dynamic_short_conv::Kernel as DynamicShortConvKernel;
 pub use head_l2_clip::Kernel as HeadL2ClipKernel;
+pub use message_mix::Kernel as MessageMixKernel;
 pub use short_conv::Kernel as ShortConvKernel;
 pub use sigmoid_gate::Kernel as SigmoidGateKernel;
 pub use softcap::Kernel as SoftcapKernel;

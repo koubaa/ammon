@@ -8,8 +8,8 @@ use crate::decode_attn::{
     RelativeAttentionPartialKernel,
 };
 use crate::decode_ops::{
-    DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
-    SoftcappedSwiGluKernel,
+    DynamicShortConvKernel, HeadL2ClipKernel, MessageMixKernel, ShortConvKernel, SigmoidGateKernel,
+    SoftcapKernel, SoftcappedSwiGluKernel,
 };
 use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::kernels::{
@@ -54,6 +54,7 @@ pub(crate) struct Blocks {
     depth_store: DepthStoreKernel,
     depth_copy_rows: DepthCopyRowsKernel,
     depth_mix: DepthMixKernel,
+    message_mix: MessageMixKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -164,6 +165,8 @@ impl Blocks {
             depth_copy_rows: DepthCopyRowsKernel::prepare(runtime)
                 .context("prepare depth_copy_rows kernel")?,
             depth_mix: DepthMixKernel::prepare(runtime).context("prepare depth_mix kernel")?,
+            message_mix: MessageMixKernel::prepare(runtime)
+                .context("prepare message_mix kernel")?,
         })
     }
 
@@ -771,6 +774,33 @@ impl Blocks {
                 scale,
             )?
             .groups([n_queries, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_add(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        a: TensorView<'_>,
+        b: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors.add_into(scheme, label, a, b, out)
+    }
+
+    pub(crate) fn record_message_mix(
+        &self,
+        scheme: &mut Scheme,
+        hidden: TensorView<'_>,
+        message: TensorView<'_>,
+        forget: TensorView<'_>,
+        gate: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        let n = hidden.numel_u32().max(1);
+        self.message_mix
+            .record(scheme, "message_mix", hidden, message, forget, gate, out)?
+            .over_1d(n);
         Ok(())
     }
 

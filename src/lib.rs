@@ -1,5 +1,6 @@
 //! Inference operators and decode control on Goldy. Not a training runtime.
 
+pub mod checkpoint;
 pub mod generate;
 pub mod model;
 pub mod tokenizer;
@@ -8,6 +9,8 @@ pub mod tokenizer;
 mod blocks;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod decode_attn;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+mod decode_layer;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod decode_ops;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
@@ -21,6 +24,10 @@ pub mod modules;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod moe;
 
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+pub use checkpoint::{load_decode_layer, DecodeLayerSpec, DecodeLayerTensors, MessageGateTensors};
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+pub use decode_layer::{DecodeLayer, DecodeLayerScalars, DecodeLayerWeights};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
