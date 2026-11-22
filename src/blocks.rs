@@ -17,6 +17,7 @@ use crate::kernels::{
     RopeStoreKernel, SwigluKernel, TensorKernels, ATTENTION_MAX_HEAD, ATTENTION_SPLIT,
     DEFAULT_ROPE_THETA,
 };
+use crate::moe::{MoeDownAccumKernel, MoeGateUpKernel, MoeTopkKernel};
 use anyhow::Context;
 use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorScalar, TensorView};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -46,6 +47,9 @@ pub(crate) struct Blocks {
     relative_attention: RelativeAttentionKernel,
     relative_attention_partial: RelativeAttentionPartialKernel,
     relative_attention_combine: RelativeAttentionCombineKernel,
+    moe_topk: MoeTopkKernel,
+    moe_gate_up: MoeGateUpKernel,
+    moe_down_accum: MoeDownAccumKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -147,6 +151,10 @@ impl Blocks {
                 .context("prepare relative_attention_partial kernel")?,
             relative_attention_combine: RelativeAttentionCombineKernel::prepare(runtime)
                 .context("prepare relative_attention_combine kernel")?,
+            moe_topk: MoeTopkKernel::prepare(runtime).context("prepare moe_topk kernel")?,
+            moe_gate_up: MoeGateUpKernel::prepare(runtime).context("prepare moe_gate_up kernel")?,
+            moe_down_accum: MoeDownAccumKernel::prepare(runtime)
+                .context("prepare moe_down_accum kernel")?,
         })
     }
 
@@ -632,6 +640,62 @@ impl Blocks {
                 capacity,
             )?
             .groups([q_heads, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_moe_topk(
+        &self,
+        scheme: &mut Scheme,
+        logits: TensorView<'_>,
+        bias: TensorView<'_>,
+        ids: TensorView<'_>,
+        weights: TensorView<'_>,
+        route_scale: f32,
+    ) -> Result<(), GoldyError> {
+        self.moe_topk
+            .record(scheme, "moe_topk", logits, bias, ids, weights, route_scale)?
+            .groups([1, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_moe_gate_up(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        gate_up: TensorView<'_>,
+        ids: TensorView<'_>,
+        gate: TensorView<'_>,
+        up: TensorView<'_>,
+        slot: u32,
+    ) -> Result<(), GoldyError> {
+        self.moe_gate_up
+            .record(scheme, "moe_gate_up", x, gate_up, ids, gate, up, slot)?
+            .over_tensor(&gate);
+        Ok(())
+    }
+
+    pub(crate) fn record_moe_down_accum(
+        &self,
+        scheme: &mut Scheme,
+        activated: TensorView<'_>,
+        down: TensorView<'_>,
+        ids: TensorView<'_>,
+        weights: TensorView<'_>,
+        out: TensorView<'_>,
+        slot: u32,
+    ) -> Result<(), GoldyError> {
+        self.moe_down_accum
+            .record(
+                scheme,
+                "moe_down_accum",
+                activated,
+                down,
+                ids,
+                weights,
+                out,
+                slot,
+            )?
+            .over_tensor(&out);
         Ok(())
     }
 

@@ -1376,3 +1376,147 @@ impl DecodeAttention {
         Ok(())
     }
 }
+
+/// Batch-1 routed experts.
+///
+/// `logits = W x`, `scores = sigmoid(logits)`. Top-k runs on
+/// `scores + bias` and the bias is not part of the weights:
+/// `weights = scores[ids] / (sum + 1e-20) * route_scale`. Equal routing keys
+/// keep the smaller expert index, then the ids are sorted ascending. Each
+/// selected expert is a softcapped SwiGLU (`[gate | up]` concatenated) and a
+/// down projection, accumulated in `out`. There is no shared expert.
+///
+/// The whole step is recorded. A replay only rewrites `x` and the step is not
+/// read back to choose experts.
+pub struct DecodeMoe {
+    blocks: Arc<Blocks>,
+    linear: Linear,
+    swiglu: SoftcappedSwiGlu,
+    n_experts: u32,
+    top_k: u32,
+    hidden: u32,
+    intermediate: u32,
+    route_scale: f32,
+    logits: Tensor,
+    ids: Tensor,
+    weights: Tensor,
+    gate: Tensor,
+    up: Tensor,
+    activated: Tensor,
+}
+
+impl DecodeMoe {
+    pub fn new(
+        runtime: &Runtime,
+        n_experts: u32,
+        top_k: u32,
+        hidden: u32,
+        intermediate: u32,
+        route_scale: f32,
+        gate_cap: f32,
+        up_cap: f32,
+    ) -> anyhow::Result<Self> {
+        if n_experts == 0 || hidden == 0 || intermediate == 0 {
+            anyhow::bail!("MoE needs a positive expert count, hidden size, and intermediate size");
+        }
+        if top_k == 0 || top_k > n_experts {
+            anyhow::bail!("MoE top-k {top_k} must be in 1..={n_experts}");
+        }
+        let f = TensorDType::F32;
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            linear: Linear::new(runtime)?,
+            swiglu: SoftcappedSwiGlu::new(runtime, gate_cap, up_cap)?,
+            n_experts,
+            top_k,
+            hidden,
+            intermediate,
+            route_scale,
+            logits: Tensor::zeros(runtime, TensorShape::vector(n_experts), f)?,
+            ids: Tensor::zeros(runtime, TensorShape::vector(top_k), f)?,
+            weights: Tensor::zeros(runtime, TensorShape::vector(top_k), f)?,
+            gate: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
+            up: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
+            activated: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
+        })
+    }
+
+    pub fn n_experts(&self) -> u32 {
+        self.n_experts
+    }
+
+    pub fn top_k(&self) -> u32 {
+        self.top_k
+    }
+
+    /// `router` is `[experts, hidden]`. `bias` is `[experts]`.
+    /// `gate_up` is `[experts, 2 * intermediate, hidden]`.
+    /// `down` is `[experts, hidden, intermediate]`.
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        router: TensorView<'_>,
+        bias: TensorView<'_>,
+        gate_up: TensorView<'_>,
+        down: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if x.shape().dims() != [self.hidden] || out.shape().dims() != [self.hidden] {
+            return Err(GoldyError::Validation("MoE x and out are [hidden]".into()));
+        }
+        if router.shape().dims() != [self.n_experts, self.hidden]
+            || bias.shape().dims() != [self.n_experts]
+        {
+            return Err(GoldyError::Validation(
+                "MoE router is [experts, hidden] and bias is [experts]".into(),
+            ));
+        }
+        let fused = 2 * self.intermediate;
+        if gate_up.shape().dims() != [self.n_experts, fused, self.hidden]
+            || down.shape().dims() != [self.n_experts, self.hidden, self.intermediate]
+        {
+            return Err(GoldyError::Validation(
+                "MoE gate_up is [experts, 2 * intermediate, hidden] and down is [experts, hidden, intermediate]"
+                    .into(),
+            ));
+        }
+        self.blocks.record_zero(scheme, "moe_out", out)?;
+        self.linear.record(scheme, router, x, self.logits.view())?;
+        self.blocks.record_moe_topk(
+            scheme,
+            self.logits.view(),
+            bias,
+            self.ids.view(),
+            self.weights.view(),
+            self.route_scale,
+        )?;
+        for slot in 0..self.top_k {
+            self.blocks.record_moe_gate_up(
+                scheme,
+                x,
+                gate_up,
+                self.ids.view(),
+                self.gate.view(),
+                self.up.view(),
+                slot,
+            )?;
+            self.swiglu.record(
+                scheme,
+                self.gate.view(),
+                self.up.view(),
+                self.activated.view(),
+            )?;
+            self.blocks.record_moe_down_accum(
+                scheme,
+                self.activated.view(),
+                down,
+                self.ids.view(),
+                self.weights.view(),
+                out,
+                slot,
+            )?;
+        }
+        Ok(())
+    }
+}
