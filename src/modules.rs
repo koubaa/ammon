@@ -403,3 +403,344 @@ impl SwiGluBlock {
         Ok(())
     }
 }
+
+/// Log-position multiplier `1 + alpha * log(max((position + 1) / floor, 1))`.
+///
+/// `position` is [`crate::kernels::DecodeStep::position`]. `alpha == 0` disables it.
+#[derive(Clone, Copy, Debug)]
+pub struct LogPositionScale {
+    pub alpha: f32,
+    pub floor: f32,
+}
+
+/// Per-head L2 clip of a `[heads, dim]` vector.
+///
+/// Optional `scale` is `[heads, dim]` and is applied before the norm. Optional
+/// [`LogPositionScale`] multiplies the clipped vector. The norm epsilon is
+/// [`crate::kernels::L2_CLIP_NORM_EPS`] (`1e-6`), not an RMSNorm epsilon.
+///
+/// `y = s * min(1, threshold / (||s||_2 + 1e-6))` with `s = x` or `s = x * scale`,
+/// then `y *= log_scale(position)` when a log scale is set.
+pub struct HeadL2Clip {
+    blocks: Arc<Blocks>,
+    threshold: f32,
+    log: Option<LogPositionScale>,
+}
+
+impl HeadL2Clip {
+    pub fn new(runtime: &Runtime, threshold: f32) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            threshold,
+            log: None,
+        })
+    }
+
+    pub fn with_log_scale(
+        runtime: &Runtime,
+        threshold: f32,
+        log: LogPositionScale,
+    ) -> anyhow::Result<Self> {
+        if log.alpha != 0.0 && log.floor <= 0.0 {
+            anyhow::bail!("log-position floor must be positive");
+        }
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            threshold,
+            log: Some(log),
+        })
+    }
+
+    pub fn threshold(&self) -> f32 {
+        self.threshold
+    }
+
+    /// `scale` is the per-element gain. `None` clips `x` directly; the unused
+    /// scale binding is `x` itself and is not read. `step` is read only when
+    /// this clip has a log-position scale. Otherwise any one-element
+    /// [`crate::kernels::DecodeStep`] buffer is enough.
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        scale: Option<TensorView<'_>>,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if x.shape().rank() != 2 || out.shape().dims() != x.shape().dims() {
+            return Err(GoldyError::Validation(
+                "l2 clip: x and out must be matching rank-2 [heads, dim] tensors".into(),
+            ));
+        }
+        let (scale, use_scale) = match scale {
+            Some(scale) => {
+                if scale.shape().dims() != x.shape().dims() {
+                    return Err(GoldyError::Validation("l2 clip: scale must match x".into()));
+                }
+                (scale, 1u32)
+            }
+            None => (x, 0u32),
+        };
+        let (alpha, floor) = match self.log {
+            Some(log) => (log.alpha, log.floor),
+            None => (0.0, 1.0),
+        };
+        self.blocks.record_head_l2_clip(
+            scheme,
+            x,
+            scale,
+            out,
+            step,
+            self.threshold,
+            alpha,
+            floor,
+            use_scale,
+        )
+    }
+}
+
+/// `out = cap * tanh(x / cap)`, using `goldy::gpu::tanh`.
+pub struct Softcap {
+    blocks: Arc<Blocks>,
+    cap: f32,
+}
+
+impl Softcap {
+    pub fn new(runtime: &Runtime, cap: f32) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            cap,
+        })
+    }
+
+    pub fn cap(&self) -> f32 {
+        self.cap
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if out.shape().dims() != x.shape().dims() {
+            return Err(GoldyError::Validation("softcap: out must match x".into()));
+        }
+        self.blocks.record_softcap(scheme, x, out, self.cap)
+    }
+}
+
+/// In-place `values *= sigmoid(logits)`, using `goldy::gpu::sigmoid`.
+pub struct SigmoidGate {
+    blocks: Arc<Blocks>,
+}
+
+impl SigmoidGate {
+    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+        })
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        values: TensorView<'_>,
+        logits: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if logits.shape().dims() != values.shape().dims() {
+            return Err(GoldyError::Validation(
+                "sigmoid gate: logits must match values".into(),
+            ));
+        }
+        self.blocks.record_sigmoid_gate(scheme, values, logits)
+    }
+}
+
+/// `out = softcap(gate) * sigmoid(gate) * softcap(up)`.
+///
+/// `sigmoid` sees the raw gate and is `goldy::gpu::sigmoid`. `gate_cap` bounds
+/// only the linear gate factor. Both caps use `goldy::gpu::tanh`.
+pub struct SoftcappedSwiGlu {
+    blocks: Arc<Blocks>,
+    gate_cap: f32,
+    up_cap: f32,
+}
+
+impl SoftcappedSwiGlu {
+    pub fn new(runtime: &Runtime, gate_cap: f32, up_cap: f32) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            gate_cap,
+            up_cap,
+        })
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        gate: TensorView<'_>,
+        up: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if up.shape().dims() != gate.shape().dims() || out.shape().dims() != gate.shape().dims() {
+            return Err(GoldyError::Validation(
+                "softcapped swiglu: gate, up, and out must match".into(),
+            ));
+        }
+        self.blocks
+            .record_softcapped_swiglu(scheme, gate, up, out, self.gate_cap, self.up_cap)
+    }
+}
+
+fn require_conv_shape(channels: u32, kernel_size: u32) -> anyhow::Result<()> {
+    if channels == 0 || kernel_size == 0 {
+        anyhow::bail!("short conv needs a positive channel count and kernel size");
+    }
+    Ok(())
+}
+
+/// Static one-token causal depthwise convolution.
+///
+/// Owns `[channels, kernel]` of running state, oldest sample first. `weight` is
+/// `[channels, kernel]` in conv1d order (the last tap multiplies the current
+/// token). Each [`Self::record`] consumes one token and updates the state.
+/// `out = (conv + x) / sqrt(kernel + 1)`. [`Self::record_reset`] zeroes the state.
+///
+/// One token per [`Self::record`]. A prefill is that many records in order.
+/// The state lives on this module; it is not snapshotted or branched.
+pub struct ShortConv {
+    blocks: Arc<Blocks>,
+    state: Tensor,
+    channels: u32,
+    kernel_size: u32,
+}
+
+impl ShortConv {
+    pub fn new(runtime: &Runtime, channels: u32, kernel_size: u32) -> anyhow::Result<Self> {
+        require_conv_shape(channels, kernel_size)?;
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            state: Tensor::zeros(
+                runtime,
+                TensorShape::matrix(channels, kernel_size),
+                TensorDType::F32,
+            )?,
+            channels,
+            kernel_size,
+        })
+    }
+
+    pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
+        self.blocks
+            .record_zero(scheme, "conv_reset", self.state.view())
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if x.shape().dims() != [self.channels]
+            || out.shape().dims() != [self.channels]
+            || weight.shape().dims() != [self.channels, self.kernel_size]
+        {
+            return Err(GoldyError::Validation(
+                "short conv: x and out are [channels], weight is [channels, kernel]".into(),
+            ));
+        }
+        self.blocks
+            .record_short_conv(scheme, x, weight, self.state.view(), out)
+    }
+}
+
+/// Dynamic one-token causal depthwise convolution.
+///
+/// Owns the same running state as [`ShortConv`], plus tap scratch. `static_weight`
+/// is `[kernel, channels]` with tap 0 on the current token. `proj` is
+/// `[heads * kernel, input]` and maps `dynamic_input` to per-head taps shared by
+/// that head's channels. `out = (conv + x) / sqrt(2 * kernel + 1)`.
+///
+/// One token per [`Self::record`], same as [`ShortConv`].
+pub struct DynamicShortConv {
+    blocks: Arc<Blocks>,
+    state: Tensor,
+    taps: Tensor,
+    channels: u32,
+    num_heads: u32,
+    kernel_size: u32,
+}
+
+impl DynamicShortConv {
+    pub fn new(
+        runtime: &Runtime,
+        channels: u32,
+        num_heads: u32,
+        kernel_size: u32,
+    ) -> anyhow::Result<Self> {
+        require_conv_shape(channels, kernel_size)?;
+        if num_heads == 0 || channels % num_heads != 0 {
+            anyhow::bail!(
+                "dynamic short conv channels {channels} must divide into {num_heads} heads"
+            );
+        }
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            state: Tensor::zeros(
+                runtime,
+                TensorShape::matrix(channels, kernel_size),
+                TensorDType::F32,
+            )?,
+            taps: Tensor::zeros(
+                runtime,
+                TensorShape::matrix(num_heads, kernel_size),
+                TensorDType::F32,
+            )?,
+            channels,
+            num_heads,
+            kernel_size,
+        })
+    }
+
+    pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
+        self.blocks
+            .record_zero(scheme, "conv_reset", self.state.view())
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        dynamic_input: TensorView<'_>,
+        static_weight: TensorView<'_>,
+        proj: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        let tap_len = self.num_heads * self.kernel_size;
+        if x.shape().dims() != [self.channels]
+            || out.shape().dims() != [self.channels]
+            || static_weight.shape().dims() != [self.kernel_size, self.channels]
+            || proj.shape().rank() != 2
+            || proj.shape().dim(0)? != tap_len
+            || proj.shape().dim(1)? != dynamic_input.shape().dim(0)?
+        {
+            return Err(GoldyError::Validation(
+                "dynamic short conv: x [channels], static_weight [kernel, channels], proj [heads * kernel, input]"
+                    .into(),
+            ));
+        }
+        let flat = self.taps.view().reshape(&[tap_len])?;
+        self.blocks
+            .record_linear(scheme, "conv_taps", proj, dynamic_input, flat)?;
+        self.blocks.record_dynamic_short_conv(
+            scheme,
+            x,
+            static_weight,
+            self.taps.view(),
+            self.state.view(),
+            out,
+        )
+    }
+}
