@@ -3,7 +3,10 @@
 //! Modules record dispatches into a [`goldy::Scheme`]. Exchanges stay on the
 //! submitting root; these functions only bind retained parcels.
 
-use crate::decode_attn::{KvCacheStoreKernel, RelativeAttentionKernel};
+use crate::decode_attn::{
+    KvCacheStoreKernel, RelativeAttentionCombineKernel, RelativeAttentionKernel,
+    RelativeAttentionPartialKernel,
+};
 use crate::decode_ops::{
     DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
     SoftcappedSwiGluKernel,
@@ -38,7 +41,11 @@ pub(crate) struct Blocks {
     short_conv: ShortConvKernel,
     dynamic_short_conv: DynamicShortConvKernel,
     kv_cache_store: KvCacheStoreKernel,
+    /// Serial reference. The recorded path is the split-K pair.
+    #[allow(dead_code)]
     relative_attention: RelativeAttentionKernel,
+    relative_attention_partial: RelativeAttentionPartialKernel,
+    relative_attention_combine: RelativeAttentionCombineKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -136,6 +143,10 @@ impl Blocks {
                 .context("prepare kv_cache_store kernel")?,
             relative_attention: RelativeAttentionKernel::prepare(runtime)
                 .context("prepare relative_attention kernel")?,
+            relative_attention_partial: RelativeAttentionPartialKernel::prepare(runtime)
+                .context("prepare relative_attention_partial kernel")?,
+            relative_attention_combine: RelativeAttentionCombineKernel::prepare(runtime)
+                .context("prepare relative_attention_combine kernel")?,
         })
     }
 
@@ -532,6 +543,9 @@ impl Blocks {
         Ok(())
     }
 
+    /// Serial reference for [`Self::record_relative_attention_partial`]. Not used
+    /// on the recorded path.
+    #[allow(dead_code)]
     pub(crate) fn record_relative_attention(
         &self,
         scheme: &mut Scheme,
@@ -559,6 +573,63 @@ impl Blocks {
                 step,
                 scale,
                 window,
+            )?
+            .groups([q_heads, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_relative_attention_partial(
+        &self,
+        scheme: &mut Scheme,
+        q: TensorView<'_>,
+        key_cache: TensorView<'_>,
+        value_cache: TensorView<'_>,
+        rel: TensorView<'_>,
+        partial: TensorView<'_>,
+        step: &Buffer,
+        scale: f32,
+        window: u32,
+    ) -> Result<(), GoldyError> {
+        let q_heads = q.shape().dim(0)?;
+        let splits = partial.shape().dim(1)?;
+        self.relative_attention_partial
+            .record(
+                scheme,
+                "relative_attention_partial",
+                q,
+                key_cache,
+                value_cache,
+                rel,
+                partial,
+                step,
+                scale,
+                window,
+            )?
+            .groups([q_heads * splits, 1, 1]);
+        Ok(())
+    }
+
+    pub(crate) fn record_relative_attention_combine(
+        &self,
+        scheme: &mut Scheme,
+        partial: TensorView<'_>,
+        sink: TensorView<'_>,
+        out: TensorView<'_>,
+        step: &Buffer,
+        window: u32,
+        capacity: u32,
+    ) -> Result<(), GoldyError> {
+        let q_heads = out.shape().dim(0)?;
+        self.relative_attention_combine
+            .record(
+                scheme,
+                "relative_attention_combine",
+                partial,
+                sink,
+                out,
+                step,
+                window,
+                capacity,
             )?
             .groups([q_heads, 1, 1]);
         Ok(())

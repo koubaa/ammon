@@ -20,9 +20,9 @@ pub mod modules;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
-    DecodeAttentionWeights, DecodeKvCache, DynamicShortConv, Embedding, HeadL2Clip, KvCache,
-    KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv, SigmoidGate, Softcap, SoftcappedSwiGlu,
-    SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
+    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DynamicShortConv, Embedding,
+    HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv, SigmoidGate,
+    Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
 };
 
 pub use generate::{

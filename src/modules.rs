@@ -745,17 +745,15 @@ impl DynamicShortConv {
     }
 }
 
-/// How [`DecodeKvCache`] indexes keys.
+/// Which keys a [`DecodeAttention`] reads. Capacity lives on [`DecodeKvCache`].
 ///
-/// `Sliding` keeps `window` slots and writes `position % window`. The attention
-/// then reads the last `window` positions (fewer before the window fills).
-/// That is the set a sliding layer attends: distances `0 .. window - 1`.
-/// `Full` writes the absolute position into a preallocated prefix. The occupied
-/// length grows with `position` up to `capacity`.
+/// `Sliding` attends the last `window` positions (fewer before the window
+/// fills): distances `0 .. window - 1`. `Full` attends `0 ..= position` up to
+/// the cache capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeAttentionKind {
     Sliding { window: u32 },
-    Full { capacity: u32 },
+    Full,
 }
 
 /// Key/value cache for one decode attention layer: `[capacity, kv_heads, head]`.
@@ -763,32 +761,54 @@ pub struct DecodeKvCache {
     blocks: Arc<Blocks>,
     key: Tensor,
     value: Tensor,
-    kind: DecodeAttentionKind,
+    /// `0` for a full cache. Otherwise the sliding window.
+    window: u32,
+    capacity: u32,
     kv_heads: u32,
     head_dim: u32,
 }
 
 impl DecodeKvCache {
-    pub fn new(
+    /// Ring of at least `window` slots. The attended span is still `window`;
+    /// extra slots let a later chunked write avoid overwriting keys the same
+    /// submission still reads. `capacity == window` is the decode ring.
+    pub fn sliding(
         runtime: &Runtime,
-        kind: DecodeAttentionKind,
+        window: u32,
+        capacity: u32,
         kv_heads: u32,
         head_dim: u32,
     ) -> anyhow::Result<Self> {
-        let capacity = match kind {
-            DecodeAttentionKind::Sliding { window } => {
-                if window == 0 {
-                    anyhow::bail!("sliding KV cache window must be non-zero");
-                }
-                window
-            }
-            DecodeAttentionKind::Full { capacity } => {
-                if capacity == 0 {
-                    anyhow::bail!("full KV cache capacity must be non-zero");
-                }
-                capacity
-            }
-        };
+        if window == 0 {
+            anyhow::bail!("sliding KV cache window must be non-zero");
+        }
+        if capacity < window {
+            anyhow::bail!("sliding KV capacity {capacity} is below the window {window}");
+        }
+        Self::allocate(runtime, window, capacity, kv_heads, head_dim)
+    }
+
+    /// Preallocated prefix. Rows `0 ..= position` are occupied, and `position`
+    /// must stay below `capacity`.
+    pub fn full(
+        runtime: &Runtime,
+        capacity: u32,
+        kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<Self> {
+        if capacity == 0 {
+            anyhow::bail!("full KV cache capacity must be non-zero");
+        }
+        Self::allocate(runtime, 0, capacity, kv_heads, head_dim)
+    }
+
+    fn allocate(
+        runtime: &Runtime,
+        window: u32,
+        capacity: u32,
+        kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<Self> {
         if kv_heads == 0 || head_dim == 0 {
             anyhow::bail!("KV cache needs a positive head count and head size");
         }
@@ -797,14 +817,29 @@ impl DecodeKvCache {
             blocks: blocks(runtime)?,
             key: Tensor::zeros(runtime, shape, TensorDType::F32)?,
             value: Tensor::zeros(runtime, shape, TensorDType::F32)?,
-            kind,
+            window,
+            capacity,
             kv_heads,
             head_dim,
         })
     }
 
     pub fn kind(&self) -> DecodeAttentionKind {
-        self.kind
+        if self.window == 0 {
+            DecodeAttentionKind::Full
+        } else {
+            DecodeAttentionKind::Sliding {
+                window: self.window,
+            }
+        }
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    pub fn window(&self) -> u32 {
+        self.window
     }
 
     /// Zeros the stored keys and values.
@@ -849,14 +884,123 @@ impl DecodeKvCache {
     /// must be `< capacity`. The kernels also refuse to index past the
     /// allocation if a replayed step violates that.
     pub fn check_position(&self, position: u32) -> Result<(), GoldyError> {
-        if let DecodeAttentionKind::Full { capacity } = self.kind {
-            if position >= capacity {
-                return Err(GoldyError::Validation(format!(
-                    "full KV position {position} is outside capacity {capacity}"
-                )));
-            }
+        if self.window == 0 && position >= self.capacity {
+            return Err(GoldyError::Validation(format!(
+                "full KV position {position} is outside capacity {}",
+                self.capacity
+            )));
         }
         Ok(())
+    }
+}
+
+/// Persistent state for one attention visit: KV plus both K and V convolution
+/// states.
+///
+/// `Inkling2Loop` needs one of these per layer and pass (48 for Mini). The
+/// attention module keeps only scratch, so several visits can share it.
+/// Zeroing the KV rows is optional; zeroing the convolution state is what
+/// starts a sequence.
+pub struct DecodeLayerState {
+    kv: DecodeKvCache,
+    k_conv: Tensor,
+    v_conv: Tensor,
+    partial: Tensor,
+    kernel: u32,
+}
+
+impl DecodeLayerState {
+    pub fn sliding(
+        runtime: &Runtime,
+        window: u32,
+        capacity: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        q_heads: u32,
+        kernel: u32,
+    ) -> anyhow::Result<Self> {
+        Self::from_kv(
+            runtime,
+            DecodeKvCache::sliding(runtime, window, capacity, kv_heads, head_dim)?,
+            q_heads,
+            kernel,
+            window,
+        )
+    }
+
+    pub fn full(
+        runtime: &Runtime,
+        capacity: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        q_heads: u32,
+        kernel: u32,
+    ) -> anyhow::Result<Self> {
+        Self::from_kv(
+            runtime,
+            DecodeKvCache::full(runtime, capacity, kv_heads, head_dim)?,
+            q_heads,
+            kernel,
+            capacity,
+        )
+    }
+
+    fn from_kv(
+        runtime: &Runtime,
+        kv: DecodeKvCache,
+        q_heads: u32,
+        kernel: u32,
+        attended: u32,
+    ) -> anyhow::Result<Self> {
+        if kernel == 0 || q_heads == 0 {
+            anyhow::bail!("decode state needs a kernel and query heads");
+        }
+        let kv_dim = kv.kv_heads * kv.head_dim;
+        let splits = attended.div_ceil(8).max(1);
+        let f = TensorDType::F32;
+        Ok(Self {
+            k_conv: Tensor::zeros(runtime, TensorShape::matrix(kv_dim, kernel), f)?,
+            v_conv: Tensor::zeros(runtime, TensorShape::matrix(kv_dim, kernel), f)?,
+            partial: Tensor::zeros(
+                runtime,
+                TensorShape::from_dims(&[q_heads, splits, kv.head_dim + 2])?,
+                f,
+            )?,
+            kv,
+            kernel,
+        })
+    }
+
+    pub fn kv(&self) -> &DecodeKvCache {
+        &self.kv
+    }
+
+    pub fn deposit_position(
+        &self,
+        deposit: &goldy::DepositTransaction,
+        token: u32,
+        position: u32,
+    ) -> Result<(), GoldyError> {
+        self.kv.deposit_position(deposit, token, position)
+    }
+
+    pub fn check_position(&self, position: u32) -> Result<(), GoldyError> {
+        self.kv.check_position(position)
+    }
+
+    pub fn keys(&self) -> TensorView<'_> {
+        self.kv.keys()
+    }
+
+    /// Zeros the convolution state. KV rows are left alone: a new sequence
+    /// rewrites every key it reads.
+    pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
+        self.kv
+            .blocks
+            .record_zero(scheme, "k_conv_reset", self.k_conv.view())?;
+        self.kv
+            .blocks
+            .record_zero(scheme, "v_conv_reset", self.v_conv.view())
     }
 }
 
@@ -885,29 +1029,20 @@ pub struct DecodeAttentionWeights<'a> {
     pub v_conv_proj: Option<TensorView<'a>>,
 }
 
-enum KvConv {
-    Static {
-        k: ShortConv,
-        v: ShortConv,
-    },
-    Dynamic {
-        k: DynamicShortConv,
-        v: DynamicShortConv,
-    },
-}
-
 /// Batch-1 decode attention: Q/K/relative L2 clip, V RMSNorm, short conv,
 /// ring or full KV, relative bias, per-head sink, GQA, and a sigmoid output gate.
 ///
 /// Query, key, and value streams are separate. A sliding layer passes the same
 /// tensor three times. Full layers log-scale queries and relative states when
 /// `log_scale` is set; keys are clipped with no scale and no log. The value
-/// norm is unweighted RMSNorm over each head, with `rms_eps`. Head size is at
-/// most 128.
+/// norm is unweighted RMSNorm over each head, with `rms_eps`. Head size divides
+/// 128 and is at most 128.
 ///
-/// The position lives in `step`. Call [`DecodeKvCache::check_position`] where
-/// that step is deposited. A full cache that is replayed past its capacity
-/// does not read or write outside the allocation.
+/// Per-visit KV and convolution state is a [`DecodeLayerState`]. This module
+/// holds scratch only, so one module can serve every visit. The position lives
+/// in `step`. Call [`DecodeLayerState::deposit_position`] where that step is
+/// deposited. A full cache that is replayed past its capacity does not read or
+/// write outside the allocation, and the attention output is NaN.
 pub struct DecodeAttention {
     blocks: Arc<Blocks>,
     linear: Linear,
@@ -916,7 +1051,9 @@ pub struct DecodeAttention {
     rel_clip: HeadL2Clip,
     v_norm: RmsNorm,
     gate: SigmoidGate,
-    conv: KvConv,
+    dynamic: bool,
+    taps: Tensor,
+    kernel: u32,
     kind: DecodeAttentionKind,
     q_heads: u32,
     kv_heads: u32,
@@ -962,8 +1099,10 @@ impl DecodeAttention {
                 "query heads {q_heads} must be a positive multiple of kv heads {kv_heads}"
             );
         }
-        if head_dim == 0 || head_dim > 128 {
-            anyhow::bail!("decode attention head size {head_dim} must be in 1..=128");
+        if head_dim == 0 || head_dim > 128 || 128 % head_dim != 0 {
+            anyhow::bail!(
+                "decode attention head size {head_dim} must divide 128 and be at most 128"
+            );
         }
         if hidden == 0 || d_rel == 0 || rel_extent == 0 {
             anyhow::bail!("hidden, d_rel, and rel_extent must be non-zero");
@@ -977,24 +1116,15 @@ impl DecodeAttention {
                     "sliding attention rel_extent {rel_extent} must equal the window {window}"
                 );
             }
-            DecodeAttentionKind::Full { capacity } if capacity == 0 => {
-                anyhow::bail!("full attention capacity must be non-zero");
-            }
             _ => {}
+        }
+        if conv_kernel == 0 {
+            anyhow::bail!("decode attention convolution kernel must be non-zero");
         }
         let q_dim = q_heads * head_dim;
         let kv_dim = kv_heads * head_dim;
-        let conv = if dynamic_conv {
-            KvConv::Dynamic {
-                k: DynamicShortConv::new(runtime, kv_dim, kv_heads, conv_kernel)?,
-                v: DynamicShortConv::new(runtime, kv_dim, kv_heads, conv_kernel)?,
-            }
-        } else {
-            KvConv::Static {
-                k: ShortConv::new(runtime, kv_dim, conv_kernel)?,
-                v: ShortConv::new(runtime, kv_dim, conv_kernel)?,
-            }
-        };
+        let tap_rows = if dynamic_conv { kv_heads } else { 1 };
+        let tap_cols = if dynamic_conv { conv_kernel } else { 1 };
         let q_clip = match log_scale {
             Some(log) => HeadL2Clip::with_log_scale(runtime, qk_l2_clip, log)?,
             None => HeadL2Clip::new(runtime, qk_l2_clip)?,
@@ -1014,7 +1144,9 @@ impl DecodeAttention {
             rel_clip,
             v_norm: RmsNorm::with_eps(runtime, rms_eps)?,
             gate: SigmoidGate::new(runtime)?,
-            conv,
+            dynamic: dynamic_conv,
+            taps: matrix(tap_rows, tap_cols)?,
+            kernel: conv_kernel,
             kind,
             q_heads,
             kv_heads,
@@ -1043,20 +1175,6 @@ impl DecodeAttention {
         self.kind
     }
 
-    pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
-        match &self.conv {
-            KvConv::Static { k, v } => {
-                k.record_reset(scheme)?;
-                v.record_reset(scheme)?;
-            }
-            KvConv::Dynamic { k, v } => {
-                k.record_reset(scheme)?;
-                v.record_reset(scheme)?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -1064,13 +1182,15 @@ impl DecodeAttention {
         k_hidden: TensorView<'_>,
         v_hidden: TensorView<'_>,
         weights: DecodeAttentionWeights<'_>,
-        cache: &DecodeKvCache,
+        state: &DecodeLayerState,
         step: &Buffer,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        if cache.kind != self.kind
+        let cache = &state.kv;
+        if cache.kind() != self.kind
             || cache.kv_heads != self.kv_heads
             || cache.head_dim != self.head_dim
+            || state.kernel != self.kernel
         {
             return Err(GoldyError::Validation(
                 "decode attention cache does not match this layer".into(),
@@ -1100,7 +1220,7 @@ impl DecodeAttention {
         self.expect_matrix("rel_scale", weights.rel_scale, self.q_heads, self.d_rel)?;
         let window = match self.kind {
             DecodeAttentionKind::Sliding { window } => window,
-            DecodeAttentionKind::Full { .. } => 0,
+            DecodeAttentionKind::Full => 0,
         };
 
         let q_flat = self.q.view().reshape(&[q_dim])?;
@@ -1121,7 +1241,7 @@ impl DecodeAttention {
             &self.k_conv,
             weights.k_conv,
             weights.k_conv_proj,
-            true,
+            state.k_conv.view(),
         )?;
         let k_conv = self.k_conv.view();
         self.k_clip
@@ -1134,7 +1254,7 @@ impl DecodeAttention {
             &self.v_conv,
             weights.v_conv,
             weights.v_conv_proj,
-            false,
+            state.v_conv.view(),
         )?;
         for h in 0..self.kv_heads {
             let src = self
@@ -1175,17 +1295,25 @@ impl DecodeAttention {
         self.linear
             .record(scheme, weights.wsink, q_hidden, self.sink.view())?;
 
-        self.blocks.record_relative_attention(
+        self.blocks.record_relative_attention_partial(
             scheme,
             self.q.view(),
             cache.key.view(),
             cache.value.view(),
             self.rel_logits.view(),
-            self.sink.view(),
-            self.attn.view(),
+            state.partial.view(),
             step,
             self.scale,
             window,
+        )?;
+        self.blocks.record_relative_attention_combine(
+            scheme,
+            state.partial.view(),
+            self.sink.view(),
+            self.attn.view(),
+            step,
+            window,
+            cache.capacity,
         )?;
 
         let attn_flat = self.attn.view().reshape(&[q_dim])?;
@@ -1206,58 +1334,31 @@ impl DecodeAttention {
         conv_out: &Tensor,
         conv_weight: TensorView<'_>,
         conv_proj: Option<TensorView<'_>>,
-        is_key: bool,
+        conv_state: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         self.linear.record(scheme, weight, hidden, proj.view())?;
         let out = conv_out.view().reshape(&[proj.view().numel_u32()])?;
-        match &self.conv {
-            KvConv::Static { .. } => {
-                self.record_static_conv(scheme, proj, conv_weight, out, is_key)?;
-            }
-            KvConv::Dynamic { .. } => {
-                let proj_w = conv_proj.ok_or_else(|| {
-                    GoldyError::Validation("dynamic conv requires a tap projection".into())
-                })?;
-                self.record_dynamic_conv(scheme, proj, hidden, conv_weight, proj_w, out, is_key)?;
-            }
+        if self.dynamic {
+            let proj_w = conv_proj.ok_or_else(|| {
+                GoldyError::Validation("dynamic conv requires a tap projection".into())
+            })?;
+            let tap_len = self.kv_heads * self.kernel;
+            let flat = self.taps.view().reshape(&[tap_len])?;
+            self.blocks
+                .record_linear(scheme, "conv_taps", proj_w, hidden, flat)?;
+            self.blocks.record_dynamic_short_conv(
+                scheme,
+                proj.view(),
+                conv_weight,
+                self.taps.view(),
+                conv_state,
+                out,
+            )?;
+        } else {
+            self.blocks
+                .record_short_conv(scheme, proj.view(), conv_weight, conv_state, out)?;
         }
         Ok(())
-    }
-
-    fn record_static_conv(
-        &self,
-        scheme: &mut Scheme,
-        proj: &Tensor,
-        weight: TensorView<'_>,
-        out: TensorView<'_>,
-        is_key: bool,
-    ) -> Result<(), GoldyError> {
-        let KvConv::Static { k, v } = &self.conv else {
-            return Err(GoldyError::Validation(
-                "static conv on a dynamic layer".into(),
-            ));
-        };
-        let conv = if is_key { k } else { v };
-        conv.record(scheme, proj.view(), weight, out)
-    }
-
-    fn record_dynamic_conv(
-        &self,
-        scheme: &mut Scheme,
-        proj: &Tensor,
-        hidden: TensorView<'_>,
-        weight: TensorView<'_>,
-        conv_proj: TensorView<'_>,
-        out: TensorView<'_>,
-        is_key: bool,
-    ) -> Result<(), GoldyError> {
-        let KvConv::Dynamic { k, v } = &self.conv else {
-            return Err(GoldyError::Validation(
-                "dynamic conv on a static layer".into(),
-            ));
-        };
-        let conv = if is_key { k } else { v };
-        conv.record(scheme, proj.view(), hidden, weight, conv_proj, out)
     }
 
     fn expect_matrix(
