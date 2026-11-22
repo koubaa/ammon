@@ -4,19 +4,19 @@ pub mod generate;
 pub mod model;
 pub mod tokenizer;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod blocks;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod gpu;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod kernels;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod modules;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, Embedding, KvCache, KvLayer, Linear,
-    RmsNorm, SwiGluBlock, SwiGluBlockWeights,
+    RmsNorm, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
 };
 
 pub use generate::{

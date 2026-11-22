@@ -1,4 +1,4 @@
-//! Goldy device bootstrap for CUDA / Metal builds.
+//! Goldy device bootstrap for CUDA, Metal, and Vulkan builds.
 
 use anyhow::{Context, Result};
 use goldy::{ComputePartitionSplit, Instance, RequestAdapterOptions, Runtime, RuntimeDescriptor};

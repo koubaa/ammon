@@ -15,6 +15,7 @@ goldy = { path = "../goldy", default-features = false, features = ["tensor"] }
 default = []
 cuda = ["goldy/cuda"]
 metal = ["goldy/metal"]
+vulkan = ["goldy/vulkan"]
 
 [lib]
 name = "ammon"
