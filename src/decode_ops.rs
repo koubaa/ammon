@@ -74,9 +74,12 @@ fn head_l2_clip(
 
 /// `out = cap * tanh(x / cap)`.
 ///
-/// `tanh` is the stable `exp` form: for `z >= 0`, `(1 - e^{-2z}) / (1 + e^{-2z})`,
-/// otherwise `(e^{2z} - 1) / (e^{2z} + 1)`. Replace that expansion with
-/// `goldy::gpu::tanh` when the builtin exists.
+/// For `|z| < 0.5`, `tanh` is the odd Taylor series through `z^11`. The
+/// `exp` form cancels near zero. Outside that, `z >= 0` uses
+/// `(1 - e^{-2z}) / (1 + e^{-2z})` and `z < 0` uses `(e^{2z} - 1) / (e^{2z} + 1)`.
+/// Replace this with `goldy::gpu::tanh` once that builtin matches libm for
+/// small `z` (it does not, as of goldy `83052da`). Keep the three copies
+/// (here and both softcaps in `softcapped_swiglu`) on the same series.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn softcap(
     #[tensor(shape = [n])] x: goldy::gpu::Tensor<f32>,
@@ -88,13 +91,25 @@ fn softcap(
         return;
     }
     let z = x[i] / cap;
+    let mut az = z;
+    if az < 0.0 {
+        az = -az;
+    }
     let mut t = 0.0;
-    if z >= 0.0 {
+    if az < 0.5 {
+        let z2 = z * z;
+        t = z
+            * (1.0
+                + z2 * ((-1.0 / 3.0)
+                    + z2 * ((2.0 / 15.0)
+                        + z2 * ((-17.0 / 315.0)
+                            + z2 * ((62.0 / 2835.0) + z2 * (-1382.0 / 155925.0))))));
+    } else if z >= 0.0 {
         let e = goldy::gpu::exp(-2.0 * z);
         t = (1.0 - e) / (1.0 + e);
     } else {
         let e = goldy::gpu::exp(2.0 * z);
-        t = (e - 1.0) / (1.0 + e);
+        t = (e - 1.0) / (e + 1.0);
     }
     out[i] = t * cap;
 }
@@ -125,9 +140,9 @@ fn sigmoid_gate(
 
 /// `out = softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap)`.
 ///
-/// `sigmoid` sees the raw gate. The softcaps use the same stable `tanh` as
-/// [`softcap`]. Replace both expansions with `goldy::gpu::tanh` and
-/// `goldy::gpu::sigmoid` when those builtins exist.
+/// `sigmoid` sees the raw gate. Both softcaps use the same `tanh` as
+/// [`softcap`], including the small-`z` series. Replace them with
+/// `goldy::gpu::tanh` and `goldy::gpu::sigmoid` when those builtins are precise.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn softcapped_swiglu(
     #[tensor(shape = [n])] gate: goldy::gpu::Tensor<f32>,
@@ -143,8 +158,20 @@ fn softcapped_swiglu(
     let g = gate[i];
     let u = up[i];
     let gz = g / gate_cap;
+    let mut gaz = gz;
+    if gaz < 0.0 {
+        gaz = -gaz;
+    }
     let mut gt = 0.0;
-    if gz >= 0.0 {
+    if gaz < 0.5 {
+        let z2 = gz * gz;
+        gt = gz
+            * (1.0
+                + z2 * ((-1.0 / 3.0)
+                    + z2 * ((2.0 / 15.0)
+                        + z2 * ((-17.0 / 315.0)
+                            + z2 * ((62.0 / 2835.0) + z2 * (-1382.0 / 155925.0))))));
+    } else if gz >= 0.0 {
         let e = goldy::gpu::exp(-2.0 * gz);
         gt = (1.0 - e) / (1.0 + e);
     } else {
@@ -152,8 +179,20 @@ fn softcapped_swiglu(
         gt = (e - 1.0) / (e + 1.0);
     }
     let uz = u / up_cap;
+    let mut uaz = uz;
+    if uaz < 0.0 {
+        uaz = -uaz;
+    }
     let mut ut = 0.0;
-    if uz >= 0.0 {
+    if uaz < 0.5 {
+        let z2 = uz * uz;
+        ut = uz
+            * (1.0
+                + z2 * ((-1.0 / 3.0)
+                    + z2 * ((2.0 / 15.0)
+                        + z2 * ((-17.0 / 315.0)
+                            + z2 * ((62.0 / 2835.0) + z2 * (-1382.0 / 155925.0))))));
+    } else if uz >= 0.0 {
         let e = goldy::gpu::exp(-2.0 * uz);
         ut = (1.0 - e) / (1.0 + e);
     } else {

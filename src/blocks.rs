@@ -410,11 +410,16 @@ impl Blocks {
         use_scale: u32,
     ) -> Result<(), GoldyError> {
         let heads = x.shape().dim(0)?;
+        if heads == 0 {
+            return Err(GoldyError::Validation(
+                "l2 clip: heads must be non-zero".into(),
+            ));
+        }
         self.head_l2_clip
             .record(
                 scheme, "l2_clip", x, scale, out, step, threshold, alpha, floor, use_scale,
             )?
-            .groups([heads.max(1), 1, 1]);
+            .groups([heads, 1, 1]);
         Ok(())
     }
 

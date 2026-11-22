@@ -92,11 +92,14 @@ fn head_l2_clip_matches_cpu_reference() {
                 (f64::from(want[0]) - f64::from(bare[0]) * (1.0 + 0.5 * 2.0_f64.ln())).abs() < 1e-5
             );
         }
-        cpu_ref::assert_close(
-            &format!("log-scaled l2 clip pos {pos}"),
-            &read_f32(&mut scheme, out.buffer()),
-            &want,
-        );
+        let got = read_f32(&mut scheme, out.buffer());
+        cpu_ref::assert_close(&format!("log-scaled l2 clip pos {pos}"), &got, &want);
+        if pos == 7 {
+            // libm golden for head 0, not the cpu_ref transcription:
+            // scale [2, 0.5] on [3, 4], threshold 2, then 1+0.5*ln(2).
+            assert!((f64::from(got[0]) - 2.554943345417038).abs() < 1e-5);
+            assert!((f64::from(got[1]) - 0.8516477818056793).abs() < 1e-5);
+        }
     }
 }
 
@@ -125,6 +128,25 @@ fn softcap_and_sigmoid_gate_match_cpu_reference() {
         "large negative saturates at -cap"
     );
     cpu_ref::assert_close("softcap", &read_f32(&mut scheme, out.buffer()), &want);
+
+    // Inkling softcap widths, including the near-zero region where the exp form
+    // of tanh cancels. The reference is libm tanh via cpu_ref, not the kernel series.
+    for cap in [25.0_f64, 30.0] {
+        let x_host: Vec<f32> = (0..1001).map(|i| (i as f32 / 1000.0) * 0.6 - 0.3).collect();
+        let x = vector(&device, &x_host);
+        let out = Tensor::zeros(&device, TensorShape::vector(1001), TensorDType::F32).unwrap();
+        let op = Softcap::new(&device, cap as f32).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        op.record(&mut scheme, x.view(), out.view()).unwrap();
+        let want = cpu_ref::softcap(&x_host, cap);
+        let got = read_f32(&mut scheme, out.buffer());
+        let max = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (f64::from(*g) - f64::from(*w)).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max < 1e-6, "softcap cap {cap} near zero max abs {max}");
+    }
 
     let values_host = [2.0_f32, 3.0, 4.0, 1.0];
     let logits_host = [0.0_f32, 20.0, -20.0, 1.0];
@@ -197,7 +219,15 @@ fn short_conv_matches_cpu_reference_and_resets() {
             48.0 / 3.0_f64.sqrt()
         };
         assert!((f64::from(want[0]) - closed).abs() < 1e-6);
-        cpu_ref::assert_close("static conv", &read_f32(&mut scheme, out.buffer()), &want);
+        let got = read_f32(&mut scheme, out.buffer());
+        // Formula goldens: (5*2+2)/sqrt(3), then (3*2+5*7+7)/sqrt(3).
+        let golden = if step == 0 {
+            6.92820323027551
+        } else {
+            27.71281292110204
+        };
+        assert!((f64::from(got[0]) - golden).abs() < 1e-5, "{got:?}");
+        cpu_ref::assert_close("static conv", &got, &want);
     }
 
     let mut scheme = Scheme::new(&ctx);
@@ -276,7 +306,12 @@ fn dynamic_short_conv_matches_cpu_reference_and_resets() {
         )
         .unwrap();
         let want = cpu_ref::dynamic_short_conv_step(&mut state, 2, 1, 2, &x_host, &static_w, &taps);
-        cpu_ref::assert_close("dynamic conv", &read_f32(&mut scheme, out.buffer()), &want);
+        let got = read_f32(&mut scheme, out.buffer());
+        cpu_ref::assert_close("dynamic conv", &got, &want);
+        if taps[0] == 10.0 {
+            assert!((f64::from(got[0]) - 26.832815729997474).abs() < 1e-5);
+            assert!((f64::from(got[1]) - 34.88266044899672).abs() < 1e-5);
+        }
     }
     let first = {
         let mut fresh = vec![0.0_f32; 4];
@@ -363,4 +398,144 @@ fn dynamic_short_conv_matches_cpu_reference_and_resets() {
             &want,
         );
     }
+}
+
+#[test]
+fn wide_clip_and_conv_match_reference() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let heads = 2usize;
+    let dim = 128usize;
+    let x_host = cpu_ref::pseudo_random(heads * dim, 80);
+    let scale_host = cpu_ref::pseudo_random(heads * dim, 81);
+    let x = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(heads as u32, dim as u32),
+        &x_host,
+    )
+    .unwrap();
+    let scale = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(heads as u32, dim as u32),
+        &scale_host,
+    )
+    .unwrap();
+    let out = Tensor::zeros(
+        &device,
+        TensorShape::matrix(heads as u32, dim as u32),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let clip = HeadL2Clip::with_log_scale(
+        &device,
+        1.5,
+        LogPositionScale {
+            alpha: 0.3,
+            floor: 4.0,
+        },
+    )
+    .unwrap();
+    let step = step_buf(&device, 9);
+    let mut scheme = Scheme::new(&ctx);
+    clip.record(&mut scheme, x.view(), Some(scale.view()), &step, out.view())
+        .unwrap();
+    cpu_ref::assert_close(
+        "wide l2 clip",
+        &read_f32(&mut scheme, out.buffer()),
+        &cpu_ref::head_l2_clip(&x_host, heads, dim, Some(&scale_host), 1.5, 0.3, 4.0, 9),
+    );
+
+    let empty = Tensor::zeros(&device, TensorShape::matrix(0, 4), TensorDType::F32).unwrap();
+    let plain = HeadL2Clip::new(&device, 1.0).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    let err = plain
+        .record(&mut scheme, empty.view(), None, &step, empty.view())
+        .unwrap_err();
+    assert!(err.to_string().contains("heads"), "{err}");
+
+    let channels = 1000usize;
+    let kernel = 4usize;
+    let conv = ShortConv::new(&device, channels as u32, kernel as u32).unwrap();
+    let weight_host = cpu_ref::pseudo_random(channels * kernel, 82);
+    let weight = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(channels as u32, kernel as u32),
+        &weight_host,
+    )
+    .unwrap();
+    let out = Tensor::zeros(
+        &device,
+        TensorShape::vector(channels as u32),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let mut state = vec![0.0_f32; channels * kernel];
+    for step_i in 0..3 {
+        let x_host = cpu_ref::pseudo_random(channels, 90 + step_i);
+        let x = vector(&device, &x_host);
+        let mut scheme = Scheme::new(&ctx);
+        conv.record(&mut scheme, x.view(), weight.view(), out.view())
+            .unwrap();
+        let want = cpu_ref::short_conv_step(&mut state, channels, kernel, &x_host, &weight_host);
+        cpu_ref::assert_close(
+            "wide static conv",
+            &read_f32(&mut scheme, out.buffer()),
+            &want,
+        );
+    }
+
+    let channels = 512usize;
+    let heads = 4usize;
+    let conv =
+        DynamicShortConv::new(&device, channels as u32, heads as u32, kernel as u32).unwrap();
+    let static_host = cpu_ref::pseudo_random(kernel * channels, 83);
+    let proj_host = cpu_ref::pseudo_random(heads * kernel * 3, 84);
+    let static_weight = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(kernel as u32, channels as u32),
+        &static_host,
+    )
+    .unwrap();
+    let proj = Tensor::from_f32(
+        &device,
+        TensorShape::matrix((heads * kernel) as u32, 3),
+        &proj_host,
+    )
+    .unwrap();
+    let out = Tensor::zeros(
+        &device,
+        TensorShape::vector(channels as u32),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let mut state = vec![0.0_f32; channels * kernel];
+    let x_host = cpu_ref::pseudo_random(channels, 85);
+    let dyn_host = cpu_ref::pseudo_random(3, 86);
+    let x = vector(&device, &x_host);
+    let dynamic = vector(&device, &dyn_host);
+    let mut scheme = Scheme::new(&ctx);
+    conv.record(
+        &mut scheme,
+        x.view(),
+        dynamic.view(),
+        static_weight.view(),
+        proj.view(),
+        out.view(),
+    )
+    .unwrap();
+    let taps = cpu_ref::gemv(&proj_host, heads * kernel, 3, &dyn_host);
+    let want = cpu_ref::dynamic_short_conv_step(
+        &mut state,
+        channels,
+        heads,
+        kernel,
+        &x_host,
+        &static_host,
+        &taps,
+    );
+    cpu_ref::assert_close(
+        "wide dynamic conv",
+        &read_f32(&mut scheme, out.buffer()),
+        &want,
+    );
 }

@@ -455,7 +455,10 @@ impl HeadL2Clip {
         self.threshold
     }
 
-    /// `scale` is the per-element gain. `None` clips `x` directly.
+    /// `scale` is the per-element gain. `None` clips `x` directly; the unused
+    /// scale binding is `x` itself and is not read. `step` is read only when
+    /// this clip has a log-position scale. Otherwise any one-element
+    /// [`crate::kernels::DecodeStep`] buffer is enough.
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -602,6 +605,9 @@ fn require_conv_shape(channels: u32, kernel_size: u32) -> anyhow::Result<()> {
 /// `[channels, kernel]` in conv1d order (the last tap multiplies the current
 /// token). Each [`Self::record`] consumes one token and updates the state.
 /// `out = (conv + x) / sqrt(kernel + 1)`. [`Self::record_reset`] zeroes the state.
+///
+/// One token per [`Self::record`]. A prefill is that many records in order.
+/// The state lives on this module; it is not snapshotted or branched.
 pub struct ShortConv {
     blocks: Arc<Blocks>,
     state: Tensor,
@@ -655,6 +661,8 @@ impl ShortConv {
 /// is `[kernel, channels]` with tap 0 on the current token. `proj` is
 /// `[heads * kernel, input]` and maps `dynamic_input` to per-head taps shared by
 /// that head's channels. `out = (conv + x) / sqrt(2 * kernel + 1)`.
+///
+/// One token per [`Self::record`], same as [`ShortConv`].
 pub struct DynamicShortConv {
     blocks: Arc<Blocks>,
     state: Tensor,
