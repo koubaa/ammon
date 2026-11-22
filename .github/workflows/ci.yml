@@ -4,9 +4,9 @@
 # as siblings. GPU tests are not optional: the job fails if lavapipe is missing
 # or does not advertise Vulkan 1.4.
 #
-# Bump GOLDY_REF when ammon should build against a newer goldy (for example
-# once goldy::gpu::tanh / sigmoid are precise enough to replace the exp
-# expansions). Change only that value; the checkout step reads it.
+# Bump GOLDY_REF when ammon should build against a newer goldy. Change only
+# that value; the checkout step reads it. The current pin is the goldy main
+# merge of koubaa/goldy#332 (precise goldy::gpu::tanh / sigmoid).
 
 name: CI
 
@@ -16,7 +16,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: 83052da5debfdb8a2217981bdf84fd223d785ea5
+  GOLDY_REF: 19a383f30e8571800d83c23a5df30d65274c0b81
 
 jobs:
   test:
