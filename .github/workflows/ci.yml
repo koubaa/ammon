@@ -7,7 +7,8 @@
 # Bump GOLDY_REF when ammon should build against a newer goldy. Change only
 # that value; the checkout step reads it. The pin is goldy main
 # (8a79d75, merge of #341, which includes #340). Indexed GEMV reads the
-# slab in place, and a unit softcap is one tanh inside goldy.
+# slab in place, and a unit softcap is one tanh inside goldy. Retained
+# command buffers keep their own frame-table rows.
 
 name: CI
 

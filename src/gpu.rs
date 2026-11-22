@@ -9,9 +9,10 @@ pub fn create_runtime() -> Result<Runtime> {
         .request_adapter(&RequestAdapterOptions::default())
         .context("request GPU adapter")?
         .request_runtime(&RuntimeDescriptor {
-            // Each token waits on the previous one, so commit a short head while the CPU
-            // encodes the rest. `GOLDY_PARTITION_SPLIT` overrides this.
-            compute_partition_split: Some(ComputePartitionSplit::ENCODE_OVERLAP_DEFAULT),
+            // A serial token is one command buffer. Overlapping partitions race
+            // on the hidden state, and one buffer stays inside the retained-row
+            // budget. `GOLDY_PARTITION_SPLIT` overrides this.
+            compute_partition_split: Some(ComputePartitionSplit::None),
             ..RuntimeDescriptor::default()
         })
         .context("request Goldy runtime")
