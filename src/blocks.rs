@@ -631,6 +631,17 @@ impl Blocks {
 
     /// `out = weight[ids[slot]] @ x`. The returned slab must stay alive; it is
     /// retained on this `Blocks`.
+    pub(crate) fn record_add(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        a: TensorView<'_>,
+        b: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors.add_into(scheme, label, a, b, out)
+    }
+
     pub(crate) fn record_indexed_matmul(
         &self,
         scheme: &mut Scheme,

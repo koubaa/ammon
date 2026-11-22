@@ -675,8 +675,30 @@ impl ShortConv {
                 "short conv: x and out are [channels], weight is [channels, kernel]".into(),
             ));
         }
+        self.record_at_state(scheme, x, weight, self.state.view(), step, out)
+    }
+
+    /// Position-addressed conv into `state`, which a visit owns.
+    pub fn record_at_state(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        state: TensorView<'_>,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if x.shape().dims() != [self.channels]
+            || out.shape().dims() != [self.channels]
+            || weight.shape().dims() != [self.channels, self.kernel_size]
+            || state.shape().dims() != [self.channels, self.kernel_size]
+        {
+            return Err(GoldyError::Validation(
+                "short conv: x, out, and state are [channels], weight is [channels, kernel]".into(),
+            ));
+        }
         self.blocks
-            .record_short_conv_at(scheme, x, weight, self.state.view(), step, out)
+            .record_short_conv_at(scheme, x, weight, state, step, out)
     }
 }
 
@@ -1982,4 +2004,55 @@ impl DepthRunner {
 
 fn row(tensor: TensorView<'_>, index: u32, hidden: u32) -> Result<TensorView<'_>, GoldyError> {
     tensor.narrow(0, index, 1)?.reshape(&[hidden])
+}
+
+/// Stateless depth-mix and the row copy / residual add a tape owner needs.
+///
+/// The mix is eager attention over `cat(blocks, partial)`: unweighted RMSNorm
+/// with the given `eps`, learned queries, no mask, scale supplied by the caller.
+pub struct DepthMix {
+    blocks: Arc<Blocks>,
+}
+
+impl DepthMix {
+    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+        Ok(Self {
+            blocks: blocks(runtime)?,
+        })
+    }
+
+    pub fn mix(
+        &self,
+        scheme: &mut Scheme,
+        blocks: TensorView<'_>,
+        partial: TensorView<'_>,
+        queries: TensorView<'_>,
+        out: TensorView<'_>,
+        n_blocks: u32,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), GoldyError> {
+        self.blocks
+            .record_depth_mix(scheme, blocks, partial, queries, out, n_blocks, eps, scale)
+    }
+
+    pub fn store_row(
+        &self,
+        scheme: &mut Scheme,
+        src: TensorView<'_>,
+        tape: TensorView<'_>,
+        slot: u32,
+    ) -> Result<(), GoldyError> {
+        self.blocks.record_depth_store(scheme, src, tape, slot)
+    }
+
+    pub fn add(
+        &self,
+        scheme: &mut Scheme,
+        a: TensorView<'_>,
+        b: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks.record_add(scheme, "add", a, b, out)
+    }
 }
