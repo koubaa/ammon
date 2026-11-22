@@ -6,8 +6,8 @@
 #
 # Bump GOLDY_REF when ammon should build against a newer goldy. Change only
 # that value; the checkout step reads it. The pin is goldy main
-# (6aeaa153, merge of #338). `matmul_indexed_into` selects a weight slab
-# with a device u32 id, then the ordinary matmul lowering runs.
+# (1e85889, merge of #339). Indexed GEMV reads the slab in place, and a
+# unit softcap is one tanh inside goldy.
 
 name: CI
 
@@ -17,7 +17,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: 6aeaa15355e7265e7f9a486410d7bf16e49a6c97
+  GOLDY_REF: 1e85889a948784a1931b265e7a0cfaa8b4ea73bf
 
 jobs:
   test:

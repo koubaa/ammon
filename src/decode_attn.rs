@@ -233,99 +233,150 @@ fn relative_attention_partial(
     } else if n > capacity {
         n = capacity;
     }
-    let t0 = split * 8;
-    if t0 >= n {
+    // Eight tokens per split while that covers the visible span. A longer
+    // context keeps at most ATTENTION_MAX_SPLITS columns and loops chunks.
+    let natural = (n + 7) / 8;
+    let bounded = natural > splits;
+    let mut per = 8u32;
+    if bounded {
+        per = (n + splits - 1) / splits;
+    }
+    let t_begin = split * per;
+    if t_begin >= n {
+        if bounded {
+            let out = (h * splits + split) * partial.dim(2);
+            if local < head {
+                partial[out + local] = 0.0;
+            }
+            if local == 0 {
+                partial[out + head] = -1.0e30;
+                partial[out + head + 1] = 0.0;
+            }
+        }
         return;
     }
-    let mut count = n - t0;
-    if count > 8 {
-        count = 8;
+    let mut t_end = t_begin + per;
+    if t_end > n {
+        t_end = n;
     }
-    if local < head {
-        qs[local] = q[h * head + local];
-    }
-    goldy::gpu::workgroup_barrier();
+    let mut m_run = 0.0;
+    let mut l_run = 0.0;
+    let mut acc_run = 0.0;
+    let mut started = 0u32;
+    let mut offset = t_begin;
+    while offset < t_end {
+        let t0 = offset;
+        let mut count = t_end - t0;
+        if count > 8 {
+            count = 8;
+        }
+        if local < head {
+            qs[local] = q[h * head + local];
+        }
+        goldy::gpu::workgroup_barrier();
 
-    let p = local / 16;
-    let mut dot = 0.0;
-    if p < count {
-        let logical = start + t0 + p;
-        let mut slot = logical;
-        if window != 0 {
-            slot = logical % capacity;
-        }
-        let k_base = (slot * kv_heads + kv_head) * head;
-        let mut i = local % 16;
-        while i < head {
-            dot = dot + qs[i] * key_cache[k_base + i];
-            i = i + 16;
-        }
-    }
-    lanes[local] = dot;
-    goldy::gpu::workgroup_barrier();
-    if local < count {
-        let b = local * 16;
-        let mut sum = 0.0;
-        for l in 0..16 {
-            sum = sum + lanes[b + l];
-        }
-        let logical = start + t0 + local;
-        let d = pos - logical;
-        let mut bias = 0.0;
-        if d < extent {
-            bias = rel[h * extent + d];
-        }
-        scores[local] = sum * scale + bias;
-    }
-    goldy::gpu::workgroup_barrier();
-
-    let mut m = scores[0];
-    for j in 1..count {
-        let s = scores[j];
-        if s > m {
-            m = s;
-        }
-    }
-    if local < count {
-        probs[local] = goldy::gpu::exp(scores[local] - m);
-    }
-    goldy::gpu::workgroup_barrier();
-
-    let ways = 128 / head;
-    let way = local / head;
-    let i = local % head;
-    let mut acc = 0.0;
-    if way < ways {
-        let mut j = way;
-        while j < count {
-            let logical = start + t0 + j;
+        let p = local / 16;
+        let mut dot = 0.0;
+        if p < count {
+            let logical = start + t0 + p;
             let mut slot = logical;
             if window != 0 {
                 slot = logical % capacity;
             }
-            let v = value_cache[(slot * kv_heads + kv_head) * head + i];
-            acc = acc + probs[j] * v;
-            j = j + ways;
+            let k_base = (slot * kv_heads + kv_head) * head;
+            let mut i = local % 16;
+            while i < head {
+                dot = dot + qs[i] * key_cache[k_base + i];
+                i = i + 16;
+            }
         }
-    }
-    lanes[local] = acc;
-    goldy::gpu::workgroup_barrier();
+        lanes[local] = dot;
+        goldy::gpu::workgroup_barrier();
+        if local < count {
+            let b = local * 16;
+            let mut sum = 0.0;
+            for l in 0..16 {
+                sum = sum + lanes[b + l];
+            }
+            let logical = start + t0 + local;
+            let d = pos - logical;
+            let mut bias = 0.0;
+            if d < extent {
+                bias = rel[h * extent + d];
+            }
+            scores[local] = sum * scale + bias;
+        }
+        goldy::gpu::workgroup_barrier();
 
+        let mut m = scores[0];
+        for j in 1..count {
+            let s = scores[j];
+            if s > m {
+                m = s;
+            }
+        }
+        let mut m_new = m;
+        if started != 0u32 && m_run > m_new {
+            m_new = m_run;
+        }
+        if local < count {
+            probs[local] = goldy::gpu::exp(scores[local] - m_new);
+        }
+        goldy::gpu::workgroup_barrier();
+
+        let ways = 128 / head;
+        let way = local / head;
+        let i = local % head;
+        let mut acc = 0.0;
+        if way < ways {
+            let mut j = way;
+            while j < count {
+                let logical = start + t0 + j;
+                let mut slot = logical;
+                if window != 0 {
+                    slot = logical % capacity;
+                }
+                let v = value_cache[(slot * kv_heads + kv_head) * head + i];
+                acc = acc + probs[j] * v;
+                j = j + ways;
+            }
+        }
+        lanes[local] = acc;
+        goldy::gpu::workgroup_barrier();
+
+        let mut total = 0.0;
+        if local < head {
+            total = lanes[local];
+            for w in 1..ways {
+                total = total + lanes[w * head + local];
+            }
+        }
+        let mut rescale = 1.0;
+        if started != 0u32 {
+            rescale = goldy::gpu::exp(m_run - m_new);
+        }
+        if local < head {
+            acc_run = acc_run * rescale + total;
+        }
+        if local == 0 {
+            let mut chunk_l = 0.0;
+            for j in 0..count {
+                chunk_l = chunk_l + probs[j];
+            }
+            l_run = l_run * rescale + chunk_l;
+        }
+        // Same m_new on every thread. l_run stays on thread 0, which stores it.
+        m_run = m_new;
+        started = 1u32;
+        offset = offset + count;
+    }
     let out = (h * splits + split) * partial.dim(2);
     if local < head {
-        let mut total = lanes[local];
-        for w in 1..ways {
-            total = total + lanes[w * head + local];
-        }
-        partial[out + local] = total;
+        partial[out + local] = acc_run;
     }
     if local == 0 {
-        let mut l = 0.0;
-        for j in 0..count {
-            l = l + probs[j];
-        }
-        partial[out + head] = m;
-        partial[out + head + 1] = l;
+        partial[out + head] = m_run;
+        partial[out + head + 1] = l_run;
     }
 }
 
@@ -367,7 +418,11 @@ fn relative_attention_combine(
     } else if n > capacity {
         n = capacity;
     }
-    let live = (n + 7) / 8;
+    let natural = (n + 7) / 8;
+    let mut live = natural;
+    if natural > partial.dim(1) {
+        live = partial.dim(1);
+    }
     let base = h * partial.dim(1) * slot;
 
     let mut m = partial[base + head];
