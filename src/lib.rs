@@ -1,5 +1,6 @@
 //! Inference operators and decode control on Goldy. Not a training runtime.
 
+pub mod checkpoint;
 pub mod generate;
 pub mod model;
 pub mod tokenizer;

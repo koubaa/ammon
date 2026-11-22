@@ -654,6 +654,30 @@ impl ShortConv {
         self.blocks
             .record_short_conv(scheme, x, weight, self.state.view(), out)
     }
+
+    /// Like [`Self::record`], but the ring slot is `DecodeStep.position`.
+    ///
+    /// Submitting the same position again rewrites that slot and leaves the
+    /// older taps where they are.
+    pub fn record_at(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if x.shape().dims() != [self.channels]
+            || out.shape().dims() != [self.channels]
+            || weight.shape().dims() != [self.channels, self.kernel_size]
+        {
+            return Err(GoldyError::Validation(
+                "short conv: x and out are [channels], weight is [channels, kernel]".into(),
+            ));
+        }
+        self.blocks
+            .record_short_conv_at(scheme, x, weight, self.state.view(), step, out)
+    }
 }
 
 /// Dynamic one-token causal depthwise convolution.
@@ -907,6 +931,13 @@ pub struct DecodeLayerState {
     v_conv: Tensor,
     partial: Tensor,
     kernel: u32,
+    /// Post-attention and post-MLP conv rings. Present after [`Self::with_post_conv`].
+    ///
+    /// `partial` is `[q_heads, attended.div_ceil(8), head_dim + 2]`. `attended`
+    /// is the sliding window, or the full-cache capacity. The extra two lanes
+    /// are the running max and the sum of exp for split-K combine.
+    post_attn: Option<Tensor>,
+    post_mlp: Option<Tensor>,
 }
 
 impl DecodeLayerState {
@@ -968,7 +999,29 @@ impl DecodeLayerState {
             )?,
             kv,
             kernel,
+            post_attn: None,
+            post_mlp: None,
         })
+    }
+
+    /// Own the post-attention and post-MLP conv rings on this visit.
+    ///
+    /// A module shared across visits must not keep these itself: a later pass
+    /// would otherwise continue the previous pass's history.
+    pub fn with_post_conv(mut self, runtime: &Runtime, hidden: u32) -> anyhow::Result<Self> {
+        let shape = TensorShape::matrix(hidden, self.kernel);
+        let f = TensorDType::F32;
+        self.post_attn = Some(Tensor::zeros(runtime, shape, f)?);
+        self.post_mlp = Some(Tensor::zeros(runtime, shape, f)?);
+        Ok(self)
+    }
+
+    pub fn post_attn(&self) -> Option<TensorView<'_>> {
+        self.post_attn.as_ref().map(Tensor::view)
+    }
+
+    pub fn post_mlp(&self) -> Option<TensorView<'_>> {
+        self.post_mlp.as_ref().map(Tensor::view)
     }
 
     pub fn kv(&self) -> &DecodeKvCache {
@@ -1000,7 +1053,18 @@ impl DecodeLayerState {
             .record_zero(scheme, "k_conv_reset", self.k_conv.view())?;
         self.kv
             .blocks
-            .record_zero(scheme, "v_conv_reset", self.v_conv.view())
+            .record_zero(scheme, "v_conv_reset", self.v_conv.view())?;
+        if let Some(state) = self.post_attn.as_ref() {
+            self.kv
+                .blocks
+                .record_zero(scheme, "post_attn_reset", state.view())?;
+        }
+        if let Some(state) = self.post_mlp.as_ref() {
+            self.kv
+                .blocks
+                .record_zero(scheme, "post_mlp_reset", state.view())?;
+        }
+        Ok(())
     }
 }
 
@@ -1242,6 +1306,7 @@ impl DecodeAttention {
             weights.k_conv,
             weights.k_conv_proj,
             state.k_conv.view(),
+            step,
         )?;
         let k_conv = self.k_conv.view();
         self.k_clip
@@ -1255,6 +1320,7 @@ impl DecodeAttention {
             weights.v_conv,
             weights.v_conv_proj,
             state.v_conv.view(),
+            step,
         )?;
         for h in 0..self.kv_heads {
             let src = self
@@ -1335,6 +1401,7 @@ impl DecodeAttention {
         conv_weight: TensorView<'_>,
         conv_proj: Option<TensorView<'_>>,
         conv_state: TensorView<'_>,
+        step: &Buffer,
     ) -> Result<(), GoldyError> {
         self.linear.record(scheme, weight, hidden, proj.view())?;
         let out = conv_out.view().reshape(&[proj.view().numel_u32()])?;
@@ -1346,17 +1413,24 @@ impl DecodeAttention {
             let flat = self.taps.view().reshape(&[tap_len])?;
             self.blocks
                 .record_linear(scheme, "conv_taps", proj_w, hidden, flat)?;
-            self.blocks.record_dynamic_short_conv(
+            self.blocks.record_dynamic_short_conv_at(
                 scheme,
                 proj.view(),
                 conv_weight,
                 self.taps.view(),
                 conv_state,
+                step,
                 out,
             )?;
         } else {
-            self.blocks
-                .record_short_conv(scheme, proj.view(), conv_weight, conv_state, out)?;
+            self.blocks.record_short_conv_at(
+                scheme,
+                proj.view(),
+                conv_weight,
+                conv_state,
+                step,
+                out,
+            )?;
         }
         Ok(())
     }
@@ -1400,8 +1474,6 @@ pub struct DecodeMoe {
     logits: Tensor,
     ids: Tensor,
     weights: Tensor,
-    gate: Tensor,
-    up: Tensor,
     activated: Tensor,
 }
 
@@ -1433,10 +1505,8 @@ impl DecodeMoe {
             intermediate,
             route_scale,
             logits: Tensor::zeros(runtime, TensorShape::vector(n_experts), f)?,
-            ids: Tensor::zeros(runtime, TensorShape::vector(top_k), f)?,
+            ids: Tensor::zeros(runtime, TensorShape::vector(top_k), TensorDType::U32)?,
             weights: Tensor::zeros(runtime, TensorShape::vector(top_k), f)?,
-            gate: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
-            up: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
             activated: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
         })
     }
@@ -1491,31 +1561,48 @@ impl DecodeMoe {
             self.weights.view(),
             self.route_scale,
         )?;
+        let fused_len = 2 * self.intermediate;
         for slot in 0..self.top_k {
-            self.blocks.record_moe_gate_up(
+            let fused = Tensor::zeros(
+                self.blocks.runtime(),
+                TensorShape::vector(fused_len),
+                TensorDType::F32,
+            )?;
+            self.blocks.record_indexed_matmul(
                 scheme,
-                x,
+                "moe_gate_up",
                 gate_up,
+                x,
                 self.ids.view(),
-                self.gate.view(),
-                self.up.view(),
                 slot,
+                fused.view(),
             )?;
-            self.swiglu.record(
-                scheme,
-                self.gate.view(),
-                self.up.view(),
-                self.activated.view(),
+            let rows = fused.view().reshape(&[2, self.intermediate])?;
+            let gate = rows.narrow(0, 0, 1)?.reshape(&[self.intermediate])?;
+            let up = rows.narrow(0, 1, 1)?.reshape(&[self.intermediate])?;
+            self.swiglu
+                .record(scheme, gate, up, self.activated.view())?;
+            let projected = Tensor::zeros(
+                self.blocks.runtime(),
+                TensorShape::vector(self.hidden),
+                TensorDType::F32,
             )?;
-            self.blocks.record_moe_down_accum(
+            self.blocks.record_indexed_matmul(
                 scheme,
-                self.activated.view(),
+                "moe_down",
                 down,
+                self.activated.view(),
                 self.ids.view(),
-                self.weights.view(),
-                out,
                 slot,
+                projected.view(),
             )?;
+            let weight = self.weights.view().narrow(0, slot, 1)?;
+            let mut rec = self.blocks.tensor_recorder(scheme);
+            let scaled = rec.mul("moe_scale", projected.view(), weight)?;
+            rec.add_into("moe_accum", out, scaled.view(), out)?;
+            self.blocks.keep_tensor(fused);
+            self.blocks.keep_tensor(projected);
+            self.blocks.keep_tensor(scaled);
         }
         Ok(())
     }

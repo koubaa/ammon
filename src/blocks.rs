@@ -8,8 +8,8 @@ use crate::decode_attn::{
     RelativeAttentionPartialKernel,
 };
 use crate::decode_ops::{
-    DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
-    SoftcappedSwiGluKernel,
+    DynamicShortConvAtKernel, DynamicShortConvKernel, HeadL2ClipKernel, ShortConvAtKernel,
+    ShortConvKernel, SigmoidGateKernel, SoftcapKernel, SoftcappedSwiGluKernel,
 };
 use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::kernels::{
@@ -20,7 +20,9 @@ use crate::kernels::{
 };
 use crate::moe::{MoeDownAccumKernel, MoeGateUpKernel, MoeTopkKernel};
 use anyhow::Context;
-use goldy::{Buffer, GoldyError, Runtime, Scheme, TensorScalar, TensorView};
+use goldy::{
+    Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorScalar, TensorShape, TensorView,
+};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
@@ -41,7 +43,12 @@ pub(crate) struct Blocks {
     sigmoid_gate: SigmoidGateKernel,
     softcapped_swiglu: SoftcappedSwiGluKernel,
     short_conv: ShortConvKernel,
+    short_conv_at: ShortConvAtKernel,
     dynamic_short_conv: DynamicShortConvKernel,
+    dynamic_short_conv_at: DynamicShortConvAtKernel,
+    /// Tensor-algebra temps. The scheme does not own them.
+    algebra: Mutex<Vec<Tensor>>,
+    runtime: Runtime,
     kv_cache_store: KvCacheStoreKernel,
     /// Serial reference. The recorded path is the split-K pair.
     #[allow(dead_code)]
@@ -145,8 +152,14 @@ impl Blocks {
             softcapped_swiglu: SoftcappedSwiGluKernel::prepare(runtime)
                 .context("prepare softcapped_swiglu kernel")?,
             short_conv: ShortConvKernel::prepare(runtime).context("prepare short_conv kernel")?,
+            short_conv_at: ShortConvAtKernel::prepare(runtime)
+                .context("prepare short_conv_at kernel")?,
             dynamic_short_conv: DynamicShortConvKernel::prepare(runtime)
                 .context("prepare dynamic_short_conv kernel")?,
+            dynamic_short_conv_at: DynamicShortConvAtKernel::prepare(runtime)
+                .context("prepare dynamic_short_conv_at kernel")?,
+            algebra: Mutex::new(Vec::new()),
+            runtime: runtime.clone(),
             kv_cache_store: KvCacheStoreKernel::prepare(runtime)
                 .context("prepare kv_cache_store kernel")?,
             relative_attention: RelativeAttentionKernel::prepare(runtime)
@@ -377,10 +390,7 @@ impl Blocks {
         out: TensorView<'_>,
         eps: f32,
     ) -> Result<(), GoldyError> {
-        self.rmsnorm
-            .record(scheme, "rmsnorm", x, weight, out, eps)?
-            .groups([1, 1, 1]);
-        Ok(())
+        self.record_rms_algebra(scheme, x, Some(weight), out, eps)
     }
 
     pub(crate) fn record_rmsnorm_inplace(
@@ -390,9 +400,12 @@ impl Blocks {
         weight: TensorView<'_>,
         eps: f32,
     ) -> Result<(), GoldyError> {
-        self.rmsnorm_inplace
-            .record(scheme, "rmsnorm", x, weight, eps)?
-            .groups([1, 1, 1]);
+        let tmp = self.vector(x.numel_u32())?;
+        self.record_rms_algebra(scheme, x, Some(weight), tmp.view(), eps)?;
+        self.tensors
+            .recorder(scheme)
+            .copy("rms_inplace", tmp.view(), x)?;
+        self.keep(tmp);
         Ok(())
     }
 
@@ -403,10 +416,7 @@ impl Blocks {
         out: TensorView<'_>,
         eps: f32,
     ) -> Result<(), GoldyError> {
-        self.rmsnorm_unweighted
-            .record(scheme, "rmsnorm", x, out, eps)?
-            .groups([1, 1, 1]);
-        Ok(())
+        self.record_rms_algebra(scheme, x, None, out, eps)
     }
 
     pub(crate) fn record_rmsnorm_unweighted_inplace(
@@ -415,9 +425,39 @@ impl Blocks {
         x: TensorView<'_>,
         eps: f32,
     ) -> Result<(), GoldyError> {
-        self.rmsnorm_unweighted_inplace
-            .record(scheme, "rmsnorm", x, eps)?
-            .groups([1, 1, 1]);
+        let tmp = self.vector(x.numel_u32())?;
+        self.record_rms_algebra(scheme, x, None, tmp.view(), eps)?;
+        self.tensors
+            .recorder(scheme)
+            .copy("rms_inplace", tmp.view(), x)?;
+        self.keep(tmp);
+        Ok(())
+    }
+
+    /// `out = x * rsqrt(mean(x²) + eps) * weight`. Tensor algebra, so fusion can
+    /// see it. `weight` is `None` for the unweighted form.
+    fn record_rms_algebra(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: Option<TensorView<'_>>,
+        out: TensorView<'_>,
+        eps: f32,
+    ) -> Result<(), GoldyError> {
+        let square = self.vector(x.numel_u32())?;
+        let scale = self.vector(1)?;
+        let mut rec = self.tensors.recorder(scheme);
+        rec.mul_into("rms_square", x, x, square.view())?;
+        rec.mean_into("rms_mean", square.view(), 0, scale.view())?;
+        rec.add_scalar_into("rms_eps", scale.view(), eps, scale.view())?;
+        rec.sqrt_into("rms_sqrt", scale.view(), scale.view())?;
+        rec.reciprocal_into("rms_scale", scale.view(), scale.view())?;
+        rec.mul_into("rms_normalize", scale.view(), x, out)?;
+        if let Some(weight) = weight {
+            rec.mul_into("rms_weight", weight, out, out)?;
+        }
+        self.keep(square);
+        self.keep(scale);
         Ok(())
     }
 
@@ -465,9 +505,12 @@ impl Blocks {
         out: TensorView<'_>,
         cap: f32,
     ) -> Result<(), GoldyError> {
-        self.softcap
-            .record(scheme, "softcap", x, out, cap)?
-            .over_tensor(&x);
+        let mut rec = self.tensors.recorder(scheme);
+        let scaled = rec.div_scalar("softcap_div", x, cap)?;
+        let curved = rec.tanh("softcap_tanh", scaled.view())?;
+        rec.mul_scalar_into("softcap", curved.view(), cap, out)?;
+        self.keep(scaled);
+        self.keep(curved);
         Ok(())
     }
 
@@ -477,9 +520,10 @@ impl Blocks {
         values: TensorView<'_>,
         logits: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.sigmoid_gate
-            .record(scheme, "sigmoid_gate", values, logits)?
-            .over_tensor(&values);
+        let mut rec = self.tensors.recorder(scheme);
+        let gate = rec.sigmoid("sigmoid_gate", logits)?;
+        rec.mul_into("sigmoid_gate_mul", values, gate.view(), values)?;
+        self.keep(gate);
         Ok(())
     }
 
@@ -492,9 +536,19 @@ impl Blocks {
         gate_cap: f32,
         up_cap: f32,
     ) -> Result<(), GoldyError> {
-        self.softcapped_swiglu
-            .record(scheme, "softcapped_swiglu", gate, up, out, gate_cap, up_cap)?
-            .over_tensor(&gate);
+        let g = self.vector(gate.numel_u32())?;
+        let u = self.vector(up.numel_u32())?;
+        let s = self.vector(gate.numel_u32())?;
+        self.record_softcap(scheme, gate, g.view(), gate_cap)?;
+        self.record_softcap(scheme, up, u.view(), up_cap)?;
+        let mut rec = self.tensors.recorder(scheme);
+        let sig = rec.sigmoid("swiglu_sigmoid", gate)?;
+        rec.mul_into("swiglu_sig", g.view(), sig.view(), s.view())?;
+        rec.mul_into("swiglu", s.view(), u.view(), out)?;
+        self.keep(g);
+        self.keep(u);
+        self.keep(s);
+        self.keep(sig);
         Ok(())
     }
 
@@ -533,6 +587,93 @@ impl Blocks {
             )?
             .over_tensor(&x);
         Ok(())
+    }
+
+    pub(crate) fn record_short_conv_at(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        state: TensorView<'_>,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.short_conv_at
+            .record(scheme, "short_conv_at", x, weight, state, out, step)?
+            .over_tensor(&x);
+        Ok(())
+    }
+
+    pub(crate) fn record_dynamic_short_conv_at(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        static_weight: TensorView<'_>,
+        taps: TensorView<'_>,
+        state: TensorView<'_>,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.dynamic_short_conv_at
+            .record(
+                scheme,
+                "dynamic_short_conv_at",
+                x,
+                static_weight,
+                taps,
+                state,
+                out,
+                step,
+            )?
+            .over_tensor(&x);
+        Ok(())
+    }
+
+    /// `out = weight[ids[slot]] @ x`. The returned slab must stay alive; it is
+    /// retained on this `Blocks`.
+    pub(crate) fn record_indexed_matmul(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        weight: TensorView<'_>,
+        x: TensorView<'_>,
+        ids: TensorView<'_>,
+        slot: u32,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        let slab = self
+            .tensors
+            .recorder(scheme)
+            .matmul_indexed_into(label, weight, x, ids, slot, out)?;
+        self.keep(slab);
+        Ok(())
+    }
+
+    fn vector(&self, len: u32) -> Result<Tensor, GoldyError> {
+        Tensor::zeros(
+            &self.runtime,
+            TensorShape::vector(len.max(1)),
+            TensorDType::F32,
+        )
+    }
+
+    fn keep(&self, tensor: Tensor) {
+        self.algebra.lock().expect("algebra scratch").push(tensor);
+    }
+
+    pub(crate) fn keep_tensor(&self, tensor: Tensor) {
+        self.keep(tensor);
+    }
+
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    pub(crate) fn tensor_recorder<'a>(
+        &'a self,
+        scheme: &'a mut Scheme,
+    ) -> goldy::TensorRecorder<'a> {
+        self.tensors.recorder(scheme)
     }
 
     pub(crate) fn record_kv_cache_store(
@@ -667,6 +808,7 @@ impl Blocks {
         Ok(())
     }
 
+    #[allow(dead_code)] // indexed matmul replaced the call; kept until the kernel is deleted
     pub(crate) fn record_moe_gate_up(
         &self,
         scheme: &mut Scheme,
@@ -683,6 +825,7 @@ impl Blocks {
         Ok(())
     }
 
+    #[allow(dead_code)] // indexed matmul replaced the call; kept until the kernel is deleted
     pub(crate) fn record_moe_down_accum(
         &self,
         scheme: &mut Scheme,

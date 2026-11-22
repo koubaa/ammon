@@ -158,6 +158,43 @@ fn short_conv(
     out[c] = (acc + cur) / goldy::gpu::sqrt((kernel as f32) + 1.0);
 }
 
+/// Position-addressed static conv. Slot `position % kernel` is rewritten, so
+/// submitting the same position again does not shift the history.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn short_conv_at(
+    #[tensor(shape = [channels])] x: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [channels, kernel])] weight: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [channels, kernel])] state: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [channels])] out: goldy::gpu::TensorWrite<f32>,
+    step: &[crate::kernels::DecodeStep],
+) {
+    let c = goldy::gpu::global_id().x;
+    if c >= x.len() {
+        return;
+    }
+    let kernel = state.dim(1);
+    let pos = step[0].position;
+    let base = c * kernel;
+    let cur = x[c];
+    let mut acc = 0.0;
+    let mut lag = 0u32;
+    while lag < kernel {
+        let mut token = cur;
+        if lag > 0 {
+            token = 0.0;
+            if pos >= lag {
+                let prev = (pos - lag) % kernel;
+                token = state[base + prev];
+            }
+        }
+        let tap = kernel - 1 - lag;
+        acc = acc + weight[base + tap] * token;
+        lag = lag + 1;
+    }
+    state[base + (pos % kernel)] = cur;
+    out[c] = (acc + cur) / goldy::gpu::sqrt((kernel as f32) + 1.0);
+}
+
 /// One-token dynamic causal depthwise convolution.
 ///
 /// `static_weight` is `[kernel, channels]` with tap 0 on the current token.
@@ -201,9 +238,51 @@ fn dynamic_short_conv(
     out[c] = (acc + cur) / goldy::gpu::sqrt((2.0 * (kernel as f32)) + 1.0);
 }
 
+/// Position-addressed dynamic conv. Same ring rule as [`short_conv_at`].
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn dynamic_short_conv_at(
+    #[tensor(shape = [channels])] x: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [kernel, channels])] static_weight: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [heads, kernel])] taps: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [channels, kernel])] state: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [channels])] out: goldy::gpu::TensorWrite<f32>,
+    step: &[crate::kernels::DecodeStep],
+) {
+    let c = goldy::gpu::global_id().x;
+    if c >= x.len() {
+        return;
+    }
+    let kernel = state.dim(1);
+    let channels = x.len();
+    let heads = taps.dim(0);
+    let head_dim = channels / heads;
+    let head = c / head_dim;
+    let pos = step[0].position;
+    let base = c * kernel;
+    let cur = x[c];
+    let mut acc = 0.0;
+    let mut lag = 0u32;
+    while lag < kernel {
+        let mut token = cur;
+        if lag > 0 {
+            token = 0.0;
+            if pos >= lag {
+                token = state[base + ((pos - lag) % kernel)];
+            }
+        }
+        let w = static_weight[lag * channels + c] + taps[head * kernel + lag];
+        acc = acc + w * token;
+        lag = lag + 1;
+    }
+    state[base + (pos % kernel)] = cur;
+    out[c] = (acc + cur) / goldy::gpu::sqrt((2.0 * (kernel as f32)) + 1.0);
+}
+
 pub use dynamic_short_conv::Kernel as DynamicShortConvKernel;
+pub use dynamic_short_conv_at::Kernel as DynamicShortConvAtKernel;
 pub use head_l2_clip::Kernel as HeadL2ClipKernel;
 pub use short_conv::Kernel as ShortConvKernel;
+pub use short_conv_at::Kernel as ShortConvAtKernel;
 pub use sigmoid_gate::Kernel as SigmoidGateKernel;
 pub use softcap::Kernel as SoftcapKernel;
 pub use softcapped_swiglu::Kernel as SoftcappedSwiGluKernel;

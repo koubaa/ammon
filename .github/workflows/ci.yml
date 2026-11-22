@@ -5,8 +5,9 @@
 # or does not advertise Vulkan 1.4.
 #
 # Bump GOLDY_REF when ammon should build against a newer goldy. Change only
-# that value; the checkout step reads it. The current pin is the goldy main
-# merge of koubaa/goldy#332 (precise goldy::gpu::tanh / sigmoid).
+# that value; the checkout step reads it. The current pin is goldy#338
+# (`matmul_indexed_into`: a device u32 id selects a weight slab, then the
+# ordinary matmul lowering runs).
 
 name: CI
 
@@ -16,7 +17,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: 19a383f30e8571800d83c23a5df30d65274c0b81
+  GOLDY_REF: f1289f8721566b7a9d38a44b49b97c33c8ac5308
 
 jobs:
   test:
