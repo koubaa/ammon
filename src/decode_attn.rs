@@ -183,8 +183,245 @@ fn relative_attention(
     }
 }
 
+/// Split-K score of [`relative_attention`]. Workgroup `h * splits + s` owns
+/// eight compact keys of query head `h`.
+///
+/// Compact key `i` is logical position `start + i`. A ring maps that through
+/// `logical % capacity`. The bias uses the logical distance. Splits that start
+/// at or past the visible count return without writing; the combine reads only
+/// the live prefix. A full-cache position past `capacity` returns without
+/// writing so it cannot read off the end.
+#[goldy::compute(workgroup_size = [128, 1, 1])]
+fn relative_attention_partial(
+    #[tensor(shape = [q_heads, head])] q: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [capacity, kv_heads, head])] key_cache: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [capacity, kv_heads, head])] value_cache: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, extent])] rel: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, splits, slot])] partial: goldy::gpu::TensorWrite<f32>,
+    step: &[DecodeStep],
+    scale: f32,
+    window: u32,
+) {
+    let mut qs = goldy::gpu::workgroup_array::<f32, 128>();
+    let mut lanes = goldy::gpu::workgroup_array::<f32, 128>();
+    let mut scores = goldy::gpu::workgroup_array::<f32, 8>();
+    let mut probs = goldy::gpu::workgroup_array::<f32, 8>();
+    let local = goldy::gpu::local_id().x;
+    let splits = partial.dim(1);
+    let group = goldy::gpu::workgroup_id().x;
+    let h = group / splits;
+    let split = group % splits;
+    let head = q.dim(1);
+    let extent = rel.dim(1);
+    let capacity = key_cache.dim(0);
+    let kv_heads = key_cache.dim(1);
+    let groups = q.dim(0) / kv_heads;
+    let kv_head = h / groups;
+    let pos = step[0].position;
+    if window == 0 {
+        if pos >= capacity {
+            return;
+        }
+    }
+    let mut n = pos + 1;
+    let mut start = 0u32;
+    if window != 0 {
+        if n > window {
+            start = pos + 1 - window;
+            n = window;
+        }
+    } else if n > capacity {
+        n = capacity;
+    }
+    let t0 = split * 8;
+    if t0 >= n {
+        return;
+    }
+    let mut count = n - t0;
+    if count > 8 {
+        count = 8;
+    }
+    if local < head {
+        qs[local] = q[h * head + local];
+    }
+    goldy::gpu::workgroup_barrier();
+
+    let p = local / 16;
+    let mut dot = 0.0;
+    if p < count {
+        let logical = start + t0 + p;
+        let mut slot = logical;
+        if window != 0 {
+            slot = logical % capacity;
+        }
+        let k_base = (slot * kv_heads + kv_head) * head;
+        let mut i = local % 16;
+        while i < head {
+            dot = dot + qs[i] * key_cache[k_base + i];
+            i = i + 16;
+        }
+    }
+    lanes[local] = dot;
+    goldy::gpu::workgroup_barrier();
+    if local < count {
+        let b = local * 16;
+        let mut sum = 0.0;
+        for l in 0..16 {
+            sum = sum + lanes[b + l];
+        }
+        let logical = start + t0 + local;
+        let d = pos - logical;
+        let mut bias = 0.0;
+        if d < extent {
+            bias = rel[h * extent + d];
+        }
+        scores[local] = sum * scale + bias;
+    }
+    goldy::gpu::workgroup_barrier();
+
+    let mut m = scores[0];
+    for j in 1..count {
+        let s = scores[j];
+        if s > m {
+            m = s;
+        }
+    }
+    if local < count {
+        probs[local] = goldy::gpu::exp(scores[local] - m);
+    }
+    goldy::gpu::workgroup_barrier();
+
+    let ways = 128 / head;
+    let way = local / head;
+    let i = local % head;
+    let mut acc = 0.0;
+    if way < ways {
+        let mut j = way;
+        while j < count {
+            let logical = start + t0 + j;
+            let mut slot = logical;
+            if window != 0 {
+                slot = logical % capacity;
+            }
+            let v = value_cache[(slot * kv_heads + kv_head) * head + i];
+            acc = acc + probs[j] * v;
+            j = j + ways;
+        }
+    }
+    lanes[local] = acc;
+    goldy::gpu::workgroup_barrier();
+
+    let out = (h * splits + split) * partial.dim(2);
+    if local < head {
+        let mut total = lanes[local];
+        for w in 1..ways {
+            total = total + lanes[w * head + local];
+        }
+        partial[out + local] = total;
+    }
+    if local == 0 {
+        let mut l = 0.0;
+        for j in 0..count {
+            l = l + probs[j];
+        }
+        partial[out + head] = m;
+        partial[out + head + 1] = l;
+    }
+}
+
+/// Split-K combine for [`relative_attention_partial`], with the sink logit.
+///
+/// `m = max(split maxes, sink)` and the denominator gains `exp(sink - m)`.
+/// A full-cache position past `capacity` writes NaN and does not read partials
+/// that were never stored.
+#[goldy::compute(workgroup_size = [256, 1, 1])]
+fn relative_attention_combine(
+    #[tensor(shape = [q_heads, splits, slot])] partial: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads])] sink: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [q_heads, head])] out: goldy::gpu::TensorWrite<f32>,
+    step: &[DecodeStep],
+    window: u32,
+    capacity: u32,
+) {
+    let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
+    let mut lanes = goldy::gpu::workgroup_array::<f32, 256>();
+    let mut sums = goldy::gpu::workgroup_array::<f32, 256>();
+    let h = goldy::gpu::workgroup_id().x;
+    let local = goldy::gpu::local_id().x;
+    let head = out.dim(1);
+    let slot = partial.dim(2);
+    let pos = step[0].position;
+    if window == 0 {
+        if pos >= capacity {
+            if local < head {
+                out[h * head + local] = 0.0 / 0.0;
+            }
+            return;
+        }
+    }
+    let mut n = pos + 1;
+    if window != 0 {
+        if n > window {
+            n = window;
+        }
+    } else if n > capacity {
+        n = capacity;
+    }
+    let live = (n + 7) / 8;
+    let base = h * partial.dim(1) * slot;
+
+    let mut m = partial[base + head];
+    let mut s = local;
+    while s < live {
+        let v = partial[base + s * slot + head];
+        if v > m {
+            m = v;
+        }
+        s = s + 256;
+    }
+    m = goldy::gpu::workgroup_max::<256>(m, scratch);
+    let sink_logit = sink[h];
+    if sink_logit > m {
+        m = sink_logit;
+    }
+
+    let ways = 256 / head;
+    let way = local / head;
+    let i = local % head;
+    let mut l = 0.0;
+    let mut acc = 0.0;
+    if way < ways {
+        let mut j = way;
+        while j < live {
+            let o = base + j * slot;
+            let w = goldy::gpu::exp(partial[o + head] - m);
+            l = l + partial[o + head + 1] * w;
+            acc = acc + partial[o + i] * w;
+            j = j + ways;
+        }
+    }
+    lanes[local] = acc;
+    if i == 0 {
+        sums[way] = l;
+    }
+    goldy::gpu::workgroup_barrier();
+
+    if local < head {
+        let mut total = lanes[local];
+        let mut norm = sums[0];
+        for w in 1..ways {
+            total = total + lanes[w * head + local];
+            norm = norm + sums[w];
+        }
+        norm = norm + goldy::gpu::exp(sink_logit - m);
+        out[h * head + local] = total / norm;
+    }
+}
+
 pub use kv_cache_store::Kernel as KvCacheStoreKernel;
 pub use relative_attention::Kernel as RelativeAttentionKernel;
+pub use relative_attention_combine::Kernel as RelativeAttentionCombineKernel;
+pub use relative_attention_partial::Kernel as RelativeAttentionPartialKernel;
 
 #[cfg(test)]
 mod tests {

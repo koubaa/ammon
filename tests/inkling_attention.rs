@@ -12,7 +12,8 @@ mod goldens;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights, DecodeKvCache, LogPositionScale,
+    DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights, DecodeLayerState,
+    LogPositionScale,
 };
 use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
@@ -46,6 +47,8 @@ fn matrix(device: &Runtime, rows: u32, cols: u32, data: &[f32]) -> Tensor {
 
 struct Spec {
     kind: DecodeAttentionKind,
+    /// Cache rows. For a sliding layer this is at least the window.
+    capacity: u32,
     q_heads: u32,
     kv_heads: u32,
     head: u32,
@@ -77,7 +80,26 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
         spec.log,
     )
     .unwrap();
-    let cache = DecodeKvCache::new(&device, spec.kind, spec.kv_heads, spec.head).unwrap();
+    let state = match spec.kind {
+        DecodeAttentionKind::Sliding { window } => DecodeLayerState::sliding(
+            &device,
+            window,
+            spec.capacity,
+            spec.kv_heads,
+            spec.head,
+            spec.q_heads,
+            spec.kernel,
+        ),
+        DecodeAttentionKind::Full => DecodeLayerState::full(
+            &device,
+            spec.capacity,
+            spec.kv_heads,
+            spec.head,
+            spec.q_heads,
+            spec.kernel,
+        ),
+    }
+    .unwrap();
     let q_dim = spec.q_heads * spec.head;
     let kv_dim = spec.kv_heads * spec.head;
     let wq = matrix(&device, q_dim, spec.hidden, w.wq);
@@ -143,7 +165,7 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
         k_t.view(),
         v_t.view(),
         weights,
-        &cache,
+        &state,
         &step,
         out.view(),
     )
@@ -156,7 +178,7 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
         q_t.buffer().write(0, bytemuck::cast_slice(q)).unwrap();
         k_t.buffer().write(0, bytemuck::cast_slice(k)).unwrap();
         v_t.buffer().write(0, bytemuck::cast_slice(v)).unwrap();
-        cache.deposit_position(&deposit, 0, i as u32).unwrap();
+        state.deposit_position(&deposit, 0, i as u32).unwrap();
         let _ = upload.submit().unwrap();
         let _ = recorded.submit().unwrap();
         let mut read = Scheme::new(&ctx);
@@ -247,6 +269,7 @@ fn sliding_window_matches_transformers_including_wrap() {
     run(
         Spec {
             kind: DecodeAttentionKind::Sliding { window: 4 },
+            capacity: 4,
             q_heads: 4,
             kv_heads: 2,
             head: 8,
@@ -320,6 +343,7 @@ fn wide_gqa_head_matches_transformers_past_the_window() {
     run(
         Spec {
             kind: DecodeAttentionKind::Sliding { window: 4 },
+            capacity: 6,
             q_heads: 4,
             kv_heads: 2,
             head: 128,
@@ -392,7 +416,8 @@ fn full_attention_matches_transformers_with_log_scale_and_short_bias() {
     ];
     run(
         Spec {
-            kind: DecodeAttentionKind::Full { capacity: 8 },
+            kind: DecodeAttentionKind::Full,
+            capacity: 16,
             q_heads: 4,
             kv_heads: 2,
             head: 8,
@@ -447,7 +472,7 @@ fn mini_head_counts_construct() {
     )
     .unwrap();
     assert_eq!(attn.kind(), DecodeAttentionKind::Sliding { window: 128 });
-    let _cache = DecodeKvCache::new(&device, attn.kind(), 8, 128).unwrap();
+    let _state = DecodeLayerState::sliding(&device, 128, 128, 8, 128, 24, 4).unwrap();
 }
 
 #[test]
@@ -456,7 +481,7 @@ fn full_cache_replay_past_capacity_does_not_write() {
     let ctx = device.create_context().unwrap();
     let attn = DecodeAttention::new(
         &device,
-        DecodeAttentionKind::Full { capacity: 2 },
+        DecodeAttentionKind::Full,
         2,
         2,
         4,
@@ -471,8 +496,7 @@ fn full_cache_replay_past_capacity_does_not_write() {
         None,
     )
     .unwrap();
-    let cache =
-        DecodeKvCache::new(&device, DecodeAttentionKind::Full { capacity: 2 }, 2, 4).unwrap();
+    let cache = DecodeLayerState::full(&device, 2, 2, 4, 2, 2).unwrap();
     let err = cache.check_position(2).unwrap_err();
     assert!(err.to_string().contains("outside capacity"), "{err}");
     cache.check_position(1).unwrap();
