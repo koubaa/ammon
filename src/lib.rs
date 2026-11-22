@@ -16,13 +16,15 @@ pub mod gpu;
 pub mod kernels;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod modules;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+mod moe;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
-    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DynamicShortConv, Embedding,
-    HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv, SigmoidGate,
-    Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
+    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DynamicShortConv,
+    Embedding, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv,
+    SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
 };
 
 pub use generate::{

@@ -6,8 +6,8 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 
 ## What it owns
 
-- GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV, per-head L2 clip, softcap, sigmoid gate, softcapped SwiGLU, one-token causal depthwise convolution, ring or full KV cache, relative-bias decode attention
-- Recordable modules that own decode scratch where needed (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`, `ShortConv`, `DynamicShortConv`, `DecodeAttention`, `DecodeLayerState`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`, `HeadL2Clip`, `Softcap`, `SigmoidGate`, `SoftcappedSwiGlu`)
+- GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV, per-head L2 clip, softcap, sigmoid gate, softcapped SwiGLU, one-token causal depthwise convolution, ring or full KV cache, relative-bias decode attention, routed experts (top-k on device)
+- Recordable modules that own decode scratch where needed (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`, `ShortConv`, `DynamicShortConv`, `DecodeAttention`, `DecodeLayerState`, `DecodeMoe`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`, `HeadL2Clip`, `Softcap`, `SigmoidGate`, `SoftcappedSwiGlu`)
 - Weight view structs (`CausalAttentionBlockWeights`, `SwiGluBlockWeights`); packed checkpoints stay in architecture crates
 - Prepared kernels cached per Goldy runtime (not part of the architecture-crate API)
 - Re-exported Goldy tensor kernels: residual `add` and semantic `matmul` (`TensorKernels`)
