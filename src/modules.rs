@@ -744,3 +744,491 @@ impl DynamicShortConv {
         )
     }
 }
+
+/// How [`DecodeKvCache`] indexes keys.
+///
+/// `Sliding` keeps `window` slots and writes `position % window`. The attention
+/// then reads the last `window` positions (fewer before the window fills).
+/// That is the set a sliding layer attends: distances `0 .. window - 1`.
+/// `Full` writes the absolute position into a preallocated prefix. The occupied
+/// length grows with `position` up to `capacity`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeAttentionKind {
+    Sliding { window: u32 },
+    Full { capacity: u32 },
+}
+
+/// Key/value cache for one decode attention layer: `[capacity, kv_heads, head]`.
+pub struct DecodeKvCache {
+    blocks: Arc<Blocks>,
+    key: Tensor,
+    value: Tensor,
+    kind: DecodeAttentionKind,
+    kv_heads: u32,
+    head_dim: u32,
+}
+
+impl DecodeKvCache {
+    pub fn new(
+        runtime: &Runtime,
+        kind: DecodeAttentionKind,
+        kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<Self> {
+        let capacity = match kind {
+            DecodeAttentionKind::Sliding { window } => {
+                if window == 0 {
+                    anyhow::bail!("sliding KV cache window must be non-zero");
+                }
+                window
+            }
+            DecodeAttentionKind::Full { capacity } => {
+                if capacity == 0 {
+                    anyhow::bail!("full KV cache capacity must be non-zero");
+                }
+                capacity
+            }
+        };
+        if kv_heads == 0 || head_dim == 0 {
+            anyhow::bail!("KV cache needs a positive head count and head size");
+        }
+        let shape = TensorShape::from_dims(&[capacity, kv_heads, head_dim])?;
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            key: Tensor::zeros(runtime, shape, TensorDType::F32)?,
+            value: Tensor::zeros(runtime, shape, TensorDType::F32)?,
+            kind,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    pub fn kind(&self) -> DecodeAttentionKind {
+        self.kind
+    }
+
+    pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
+        self.blocks
+            .record_zero(scheme, "kv_reset_k", self.key.view())?;
+        self.blocks
+            .record_zero(scheme, "kv_reset_v", self.value.view())
+    }
+}
+
+/// Weights for one [`DecodeAttention`] step. Layout matches the bias-free
+/// projections of the reference attention module.
+pub struct DecodeAttentionWeights<'a> {
+    pub wq: TensorView<'a>,
+    pub wk: TensorView<'a>,
+    pub wv: TensorView<'a>,
+    pub wo: TensorView<'a>,
+    pub wgate: TensorView<'a>,
+    pub wsink: TensorView<'a>,
+    pub wrel: TensorView<'a>,
+    /// `[d_rel, rel_extent]`. Column `d` is the bias for distance `d`.
+    pub rel_proj: TensorView<'a>,
+    /// `[q_heads, head]` learned scale applied before the query L2 clip.
+    pub q_scale: TensorView<'a>,
+    /// `[q_heads, d_rel]` learned scale applied before the relative-state clip.
+    pub rel_scale: TensorView<'a>,
+    /// Static conv: `[kv_dim, kernel]`, last tap on the current token.
+    /// Dynamic conv: `[kernel, kv_dim]`, tap 0 on the current token.
+    pub k_conv: TensorView<'a>,
+    pub v_conv: TensorView<'a>,
+    /// Dynamic conv only: `[kv_heads * kernel, hidden]`.
+    pub k_conv_proj: Option<TensorView<'a>>,
+    pub v_conv_proj: Option<TensorView<'a>>,
+}
+
+enum KvConv {
+    Static {
+        k: ShortConv,
+        v: ShortConv,
+    },
+    Dynamic {
+        k: DynamicShortConv,
+        v: DynamicShortConv,
+    },
+}
+
+/// Batch-1 decode attention: Q/K/relative L2 clip, V RMSNorm, short conv,
+/// ring or full KV, relative bias, per-head sink, GQA, and a sigmoid output gate.
+///
+/// Query, key, and value streams are separate. A sliding layer passes the same
+/// tensor three times. Full layers log-scale queries and relative states when
+/// `log_scale` is set; keys are clipped with no scale and no log. The value
+/// norm is unweighted RMSNorm over each head, with `rms_eps`. Head size is at
+/// most 128.
+///
+/// `position` must be the value stored in `step`. A full cache rejects
+/// `position >= capacity` here, before the kernel indexes the prefix.
+pub struct DecodeAttention {
+    blocks: Arc<Blocks>,
+    linear: Linear,
+    q_clip: HeadL2Clip,
+    k_clip: HeadL2Clip,
+    rel_clip: HeadL2Clip,
+    v_norm: RmsNorm,
+    gate: SigmoidGate,
+    conv: KvConv,
+    kind: DecodeAttentionKind,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    hidden: u32,
+    d_rel: u32,
+    rel_extent: u32,
+    scale: f32,
+    q: Tensor,
+    k_proj: Tensor,
+    k_conv: Tensor,
+    k: Tensor,
+    v_proj: Tensor,
+    v_conv: Tensor,
+    v: Tensor,
+    rel_proj: Tensor,
+    rel: Tensor,
+    rel_logits: Tensor,
+    sink: Tensor,
+    attn: Tensor,
+    gate_logits: Tensor,
+}
+
+impl DecodeAttention {
+    pub fn new(
+        runtime: &Runtime,
+        kind: DecodeAttentionKind,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        hidden: u32,
+        d_rel: u32,
+        rel_extent: u32,
+        conv_kernel: u32,
+        dynamic_conv: bool,
+        qk_l2_clip: f32,
+        rel_l2_clip: f32,
+        rms_eps: f32,
+        log_scale: Option<LogPositionScale>,
+    ) -> anyhow::Result<Self> {
+        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+            anyhow::bail!(
+                "query heads {q_heads} must be a positive multiple of kv heads {kv_heads}"
+            );
+        }
+        if head_dim == 0 || head_dim > 128 {
+            anyhow::bail!("decode attention head size {head_dim} must be in 1..=128");
+        }
+        if hidden == 0 || d_rel == 0 || rel_extent == 0 {
+            anyhow::bail!("hidden, d_rel, and rel_extent must be non-zero");
+        }
+        match kind {
+            DecodeAttentionKind::Sliding { window } if window == 0 => {
+                anyhow::bail!("sliding attention window must be non-zero");
+            }
+            DecodeAttentionKind::Full { capacity } if capacity == 0 => {
+                anyhow::bail!("full attention capacity must be non-zero");
+            }
+            _ => {}
+        }
+        let q_dim = q_heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        let conv = if dynamic_conv {
+            KvConv::Dynamic {
+                k: DynamicShortConv::new(runtime, kv_dim, kv_heads, conv_kernel)?,
+                v: DynamicShortConv::new(runtime, kv_dim, kv_heads, conv_kernel)?,
+            }
+        } else {
+            KvConv::Static {
+                k: ShortConv::new(runtime, kv_dim, conv_kernel)?,
+                v: ShortConv::new(runtime, kv_dim, conv_kernel)?,
+            }
+        };
+        let q_clip = match log_scale {
+            Some(log) => HeadL2Clip::with_log_scale(runtime, qk_l2_clip, log)?,
+            None => HeadL2Clip::new(runtime, qk_l2_clip)?,
+        };
+        let rel_clip = match log_scale {
+            Some(log) => HeadL2Clip::with_log_scale(runtime, rel_l2_clip, log)?,
+            None => HeadL2Clip::new(runtime, rel_l2_clip)?,
+        };
+        let f = TensorDType::F32;
+        let matrix = |rows, cols| Tensor::zeros(runtime, TensorShape::matrix(rows, cols), f);
+        let vector = |len| Tensor::zeros(runtime, TensorShape::vector(len), f);
+        Ok(Self {
+            blocks: blocks(runtime)?,
+            linear: Linear::new(runtime)?,
+            q_clip,
+            k_clip: HeadL2Clip::new(runtime, qk_l2_clip)?,
+            rel_clip,
+            v_norm: RmsNorm::with_eps(runtime, rms_eps)?,
+            gate: SigmoidGate::new(runtime)?,
+            conv,
+            kind,
+            q_heads,
+            kv_heads,
+            head_dim,
+            hidden,
+            d_rel,
+            rel_extent,
+            scale: (f64::from(head_dim)).powf(-0.5) as f32,
+            q: matrix(q_heads, head_dim)?,
+            k_proj: vector(kv_dim)?,
+            k_conv: matrix(kv_heads, head_dim)?,
+            k: matrix(kv_heads, head_dim)?,
+            v_proj: vector(kv_dim)?,
+            v_conv: matrix(kv_heads, head_dim)?,
+            v: matrix(kv_heads, head_dim)?,
+            rel_proj: matrix(q_heads, d_rel)?,
+            rel: matrix(q_heads, d_rel)?,
+            rel_logits: matrix(q_heads, rel_extent)?,
+            sink: vector(q_heads)?,
+            attn: matrix(q_heads, head_dim)?,
+            gate_logits: vector(q_dim)?,
+        })
+    }
+
+    pub fn kind(&self) -> DecodeAttentionKind {
+        self.kind
+    }
+
+    pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
+        match &self.conv {
+            KvConv::Static { k, v } => {
+                k.record_reset(scheme)?;
+                v.record_reset(scheme)?;
+            }
+            KvConv::Dynamic { k, v } => {
+                k.record_reset(scheme)?;
+                v.record_reset(scheme)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        q_hidden: TensorView<'_>,
+        k_hidden: TensorView<'_>,
+        v_hidden: TensorView<'_>,
+        weights: DecodeAttentionWeights<'_>,
+        cache: &DecodeKvCache,
+        step: &Buffer,
+        position: u32,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if cache.kind != self.kind
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(GoldyError::Validation(
+                "decode attention cache does not match this layer".into(),
+            ));
+        }
+        let q_dim = self.q_heads * self.head_dim;
+        let kv_dim = self.kv_heads * self.head_dim;
+        let hidden = [self.hidden];
+        if q_hidden.shape().dims() != hidden
+            || k_hidden.shape().dims() != hidden
+            || v_hidden.shape().dims() != hidden
+            || out.shape().dims() != hidden
+        {
+            return Err(GoldyError::Validation(
+                "decode attention streams and out are [hidden]".into(),
+            ));
+        }
+        self.expect_matrix("wq", weights.wq, q_dim, self.hidden)?;
+        self.expect_matrix("wk", weights.wk, kv_dim, self.hidden)?;
+        self.expect_matrix("wv", weights.wv, kv_dim, self.hidden)?;
+        self.expect_matrix("wo", weights.wo, self.hidden, q_dim)?;
+        self.expect_matrix("wgate", weights.wgate, q_dim, self.hidden)?;
+        self.expect_matrix("wsink", weights.wsink, self.q_heads, self.hidden)?;
+        self.expect_matrix("wrel", weights.wrel, self.q_heads * self.d_rel, self.hidden)?;
+        self.expect_matrix("rel_proj", weights.rel_proj, self.d_rel, self.rel_extent)?;
+        self.expect_matrix("q_scale", weights.q_scale, self.q_heads, self.head_dim)?;
+        self.expect_matrix("rel_scale", weights.rel_scale, self.q_heads, self.d_rel)?;
+        let window = match self.kind {
+            DecodeAttentionKind::Sliding { window } => window,
+            DecodeAttentionKind::Full { capacity } => {
+                if position >= capacity {
+                    return Err(GoldyError::Validation(format!(
+                        "full attention position {position} is outside capacity {capacity}"
+                    )));
+                }
+                0
+            }
+        };
+
+        let q_flat = self.q.view().reshape(&[q_dim])?;
+        self.linear.record(scheme, weights.wq, q_hidden, q_flat)?;
+        self.q_clip.record(
+            scheme,
+            self.q.view(),
+            Some(weights.q_scale),
+            step,
+            self.q.view(),
+        )?;
+
+        self.project_kv(
+            scheme,
+            weights.wk,
+            k_hidden,
+            &self.k_proj,
+            &self.k_conv,
+            weights.k_conv,
+            weights.k_conv_proj,
+            true,
+        )?;
+        let k_conv = self.k_conv.view();
+        self.k_clip
+            .record(scheme, k_conv, None, step, self.k.view())?;
+        self.project_kv(
+            scheme,
+            weights.wv,
+            v_hidden,
+            &self.v_proj,
+            &self.v_conv,
+            weights.v_conv,
+            weights.v_conv_proj,
+            false,
+        )?;
+        for h in 0..self.kv_heads {
+            let src = self
+                .v_conv
+                .view()
+                .narrow(0, h, 1)?
+                .reshape(&[self.head_dim])?;
+            let dst = self.v.view().narrow(0, h, 1)?.reshape(&[self.head_dim])?;
+            self.v_norm.record_unweighted(scheme, src, dst)?;
+        }
+
+        self.blocks.record_kv_cache_store(
+            scheme,
+            self.k.view(),
+            self.v.view(),
+            cache.key.view(),
+            cache.value.view(),
+            step,
+            window,
+        )?;
+
+        let rel_flat = self.rel_proj.view().reshape(&[self.q_heads * self.d_rel])?;
+        self.linear
+            .record(scheme, weights.wrel, q_hidden, rel_flat)?;
+        self.rel_clip.record(
+            scheme,
+            self.rel_proj.view(),
+            Some(weights.rel_scale),
+            step,
+            self.rel.view(),
+        )?;
+        self.linear.record(
+            scheme,
+            self.rel.view(),
+            weights.rel_proj,
+            self.rel_logits.view(),
+        )?;
+        self.linear
+            .record(scheme, weights.wsink, q_hidden, self.sink.view())?;
+
+        self.blocks.record_relative_attention(
+            scheme,
+            self.q.view(),
+            cache.key.view(),
+            cache.value.view(),
+            self.rel_logits.view(),
+            self.sink.view(),
+            self.attn.view(),
+            step,
+            self.scale,
+            window,
+        )?;
+
+        let attn_flat = self.attn.view().reshape(&[q_dim])?;
+        self.linear
+            .record(scheme, weights.wgate, q_hidden, self.gate_logits.view())?;
+        self.gate
+            .record(scheme, attn_flat, self.gate_logits.view())?;
+        self.linear.record(scheme, weights.wo, attn_flat, out)?;
+        Ok(())
+    }
+
+    fn project_kv(
+        &self,
+        scheme: &mut Scheme,
+        weight: TensorView<'_>,
+        hidden: TensorView<'_>,
+        proj: &Tensor,
+        conv_out: &Tensor,
+        conv_weight: TensorView<'_>,
+        conv_proj: Option<TensorView<'_>>,
+        is_key: bool,
+    ) -> Result<(), GoldyError> {
+        self.linear.record(scheme, weight, hidden, proj.view())?;
+        let out = conv_out.view().reshape(&[proj.view().numel_u32()])?;
+        match &self.conv {
+            KvConv::Static { .. } => {
+                self.record_static_conv(scheme, proj, conv_weight, out, is_key)?;
+            }
+            KvConv::Dynamic { .. } => {
+                let proj_w = conv_proj.ok_or_else(|| {
+                    GoldyError::Validation("dynamic conv requires a tap projection".into())
+                })?;
+                self.record_dynamic_conv(scheme, proj, hidden, conv_weight, proj_w, out, is_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_static_conv(
+        &self,
+        scheme: &mut Scheme,
+        proj: &Tensor,
+        weight: TensorView<'_>,
+        out: TensorView<'_>,
+        is_key: bool,
+    ) -> Result<(), GoldyError> {
+        let KvConv::Static { k, v } = &self.conv else {
+            return Err(GoldyError::Validation(
+                "static conv on a dynamic layer".into(),
+            ));
+        };
+        let conv = if is_key { k } else { v };
+        conv.record(scheme, proj.view(), weight, out)
+    }
+
+    fn record_dynamic_conv(
+        &self,
+        scheme: &mut Scheme,
+        proj: &Tensor,
+        hidden: TensorView<'_>,
+        weight: TensorView<'_>,
+        conv_proj: TensorView<'_>,
+        out: TensorView<'_>,
+        is_key: bool,
+    ) -> Result<(), GoldyError> {
+        let KvConv::Dynamic { k, v } = &self.conv else {
+            return Err(GoldyError::Validation(
+                "dynamic conv on a static layer".into(),
+            ));
+        };
+        let conv = if is_key { k } else { v };
+        conv.record(scheme, proj.view(), hidden, weight, conv_proj, out)
+    }
+
+    fn expect_matrix(
+        &self,
+        name: &str,
+        tensor: TensorView<'_>,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(), GoldyError> {
+        if tensor.shape().dims() != [rows, cols] {
+            return Err(GoldyError::Validation(format!(
+                "decode attention {name} must be [{rows}, {cols}]"
+            )));
+        }
+        Ok(())
+    }
+}

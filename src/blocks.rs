@@ -3,6 +3,7 @@
 //! Modules record dispatches into a [`goldy::Scheme`]. Exchanges stay on the
 //! submitting root; these functions only bind retained parcels.
 
+use crate::decode_attn::{KvCacheStoreKernel, RelativeAttentionKernel};
 use crate::decode_ops::{
     DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
     SoftcappedSwiGluKernel,
@@ -36,6 +37,8 @@ pub(crate) struct Blocks {
     softcapped_swiglu: SoftcappedSwiGluKernel,
     short_conv: ShortConvKernel,
     dynamic_short_conv: DynamicShortConvKernel,
+    kv_cache_store: KvCacheStoreKernel,
+    relative_attention: RelativeAttentionKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -129,6 +132,10 @@ impl Blocks {
             short_conv: ShortConvKernel::prepare(runtime).context("prepare short_conv kernel")?,
             dynamic_short_conv: DynamicShortConvKernel::prepare(runtime)
                 .context("prepare dynamic_short_conv kernel")?,
+            kv_cache_store: KvCacheStoreKernel::prepare(runtime)
+                .context("prepare kv_cache_store kernel")?,
+            relative_attention: RelativeAttentionKernel::prepare(runtime)
+                .context("prepare relative_attention kernel")?,
         })
     }
 
@@ -497,6 +504,63 @@ impl Blocks {
                 out,
             )?
             .over_tensor(&x);
+        Ok(())
+    }
+
+    pub(crate) fn record_kv_cache_store(
+        &self,
+        scheme: &mut Scheme,
+        k: TensorView<'_>,
+        v: TensorView<'_>,
+        key_cache: TensorView<'_>,
+        value_cache: TensorView<'_>,
+        step: &Buffer,
+        window: u32,
+    ) -> Result<(), GoldyError> {
+        self.kv_cache_store
+            .record(
+                scheme,
+                "kv_cache_store",
+                k,
+                v,
+                key_cache,
+                value_cache,
+                step,
+                window,
+            )?
+            .over_tensor(&k);
+        Ok(())
+    }
+
+    pub(crate) fn record_relative_attention(
+        &self,
+        scheme: &mut Scheme,
+        q: TensorView<'_>,
+        key_cache: TensorView<'_>,
+        value_cache: TensorView<'_>,
+        rel: TensorView<'_>,
+        sink: TensorView<'_>,
+        out: TensorView<'_>,
+        step: &Buffer,
+        scale: f32,
+        window: u32,
+    ) -> Result<(), GoldyError> {
+        let q_heads = q.shape().dim(0)?;
+        self.relative_attention
+            .record(
+                scheme,
+                "relative_attention",
+                q,
+                key_cache,
+                value_cache,
+                rel,
+                sink,
+                out,
+                step,
+                scale,
+                window,
+            )?
+            .groups([q_heads, 1, 1]);
         Ok(())
     }
 
