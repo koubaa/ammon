@@ -4,6 +4,8 @@
 
 #[path = "cpu_ref.rs"]
 mod cpu_ref;
+#[path = "transformers_goldens.rs"]
+mod goldens;
 
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
@@ -27,6 +29,13 @@ fn read_f32(scheme: &mut Scheme, buf: &goldy::Buffer) -> Vec<f32> {
     let mut sub = scheme.submit().expect("submit");
     let bytes = (&mut sub >> buf).take::<u8>().expect("host take");
     bytemuck::cast_slice(&bytes).to_vec()
+}
+
+fn max_abs(got: &[f32], want: &[f32]) -> f64 {
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (f64::from(*g) - f64::from(*w)).abs())
+        .fold(0.0, f64::max)
 }
 
 fn vector(device: &Runtime, values: &[f32]) -> Tensor {
@@ -538,4 +547,152 @@ fn wide_clip_and_conv_match_reference() {
         &read_f32(&mut scheme, out.buffer()),
         &want,
     );
+}
+
+/// Outputs of the pinned transformers classes (`eeee1109`), not of `cpu_ref`.
+#[test]
+fn matches_pinned_transformers_modules() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+
+    for (cap, y) in [
+        (25.0_f32, &goldens::SOFTCAP_25_Y),
+        (30.0, &goldens::SOFTCAP_30_Y),
+    ] {
+        let x = vector(&device, &goldens::SOFTCAP_25_X);
+        let out = Tensor::zeros(&device, TensorShape::vector(300), TensorDType::F32).unwrap();
+        let op = Softcap::new(&device, cap).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        op.record(&mut scheme, x.view(), out.view()).unwrap();
+        let err = max_abs(&read_f32(&mut scheme, out.buffer()), y);
+        assert!(err < 1e-6, "transformers softcap {cap} max abs {err}");
+    }
+
+    let gate = vector(&device, &goldens::SWIGLU_GATE);
+    let up = vector(&device, &goldens::SWIGLU_UP);
+    let out = Tensor::zeros(&device, TensorShape::vector(280), TensorDType::F32).unwrap();
+    let sw = SoftcappedSwiGlu::new(&device, 4.0, 25.0).unwrap();
+    let mut scheme = Scheme::new(&ctx);
+    sw.record(&mut scheme, gate.view(), up.view(), out.view())
+        .unwrap();
+    let err = max_abs(&read_f32(&mut scheme, out.buffer()), &goldens::SWIGLU_Y);
+    assert!(err < 1e-6, "transformers swiglu max abs {err}");
+
+    let x = Tensor::from_f32(&device, TensorShape::matrix(3, 8), &goldens::L2_X).unwrap();
+    let scale = Tensor::from_f32(&device, TensorShape::matrix(3, 8), &goldens::L2_SCALE).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::matrix(3, 8), TensorDType::F32).unwrap();
+    let clip = HeadL2Clip::with_log_scale(
+        &device,
+        1.5,
+        LogPositionScale {
+            alpha: 0.3,
+            floor: 4.0,
+        },
+    )
+    .unwrap();
+    let ys = [
+        &goldens::L2_Y_0,
+        &goldens::L2_Y_1,
+        &goldens::L2_Y_2,
+        &goldens::L2_Y_3,
+        &goldens::L2_Y_4,
+    ];
+    for (pos, y) in goldens::L2_POSITIONS.iter().zip(ys) {
+        let step = step_buf(&device, *pos);
+        let mut scheme = Scheme::new(&ctx);
+        clip.record(&mut scheme, x.view(), Some(scale.view()), &step, out.view())
+            .unwrap();
+        let err = max_abs(&read_f32(&mut scheme, out.buffer()), y);
+        assert!(err < 1e-5, "transformers l2 pos {pos} max abs {err}");
+    }
+
+    let weight =
+        Tensor::from_f32(&device, TensorShape::matrix(8, 4), &goldens::STATIC_WEIGHT).unwrap();
+    let conv = ShortConv::new(&device, 8, 4).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::vector(8), TensorDType::F32).unwrap();
+    let xs = [
+        &goldens::STATIC_X_0,
+        &goldens::STATIC_X_1,
+        &goldens::STATIC_X_2,
+        &goldens::STATIC_X_3,
+        &goldens::STATIC_X_4,
+        &goldens::STATIC_X_5,
+        &goldens::STATIC_X_6,
+    ];
+    let ys = [
+        &goldens::STATIC_Y_0,
+        &goldens::STATIC_Y_1,
+        &goldens::STATIC_Y_2,
+        &goldens::STATIC_Y_3,
+        &goldens::STATIC_Y_4,
+        &goldens::STATIC_Y_5,
+        &goldens::STATIC_Y_6,
+    ];
+    for (i, (x_host, y)) in xs.iter().zip(ys).enumerate() {
+        let x = vector(&device, &x_host[..]);
+        let mut scheme = Scheme::new(&ctx);
+        conv.record(&mut scheme, x.view(), weight.view(), out.view())
+            .unwrap();
+        let err = max_abs(&read_f32(&mut scheme, out.buffer()), y);
+        assert!(
+            err < 1e-5,
+            "transformers static conv step {i} max abs {err}"
+        );
+    }
+
+    let static_w = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(4, 8),
+        &goldens::DYN_STATIC_WEIGHT,
+    )
+    .unwrap();
+    let proj = Tensor::from_f32(&device, TensorShape::matrix(8, 5), &goldens::DYN_PROJ).unwrap();
+    let conv = DynamicShortConv::new(&device, 8, 2, 4).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::vector(8), TensorDType::F32).unwrap();
+    let xs = [
+        &goldens::DYN_X_0,
+        &goldens::DYN_X_1,
+        &goldens::DYN_X_2,
+        &goldens::DYN_X_3,
+        &goldens::DYN_X_4,
+        &goldens::DYN_X_5,
+        &goldens::DYN_X_6,
+    ];
+    let ins = [
+        &goldens::DYN_IN_0,
+        &goldens::DYN_IN_1,
+        &goldens::DYN_IN_2,
+        &goldens::DYN_IN_3,
+        &goldens::DYN_IN_4,
+        &goldens::DYN_IN_5,
+        &goldens::DYN_IN_6,
+    ];
+    let ys = [
+        &goldens::DYN_Y_0,
+        &goldens::DYN_Y_1,
+        &goldens::DYN_Y_2,
+        &goldens::DYN_Y_3,
+        &goldens::DYN_Y_4,
+        &goldens::DYN_Y_5,
+        &goldens::DYN_Y_6,
+    ];
+    for (i, ((x_host, din), y)) in xs.iter().zip(ins).zip(ys).enumerate() {
+        let x = vector(&device, &x_host[..]);
+        let dynamic = vector(&device, &din[..]);
+        let mut scheme = Scheme::new(&ctx);
+        conv.record(
+            &mut scheme,
+            x.view(),
+            dynamic.view(),
+            static_w.view(),
+            proj.view(),
+            out.view(),
+        )
+        .unwrap();
+        let err = max_abs(&read_f32(&mut scheme, out.buffer()), y);
+        assert!(
+            err < 1e-5,
+            "transformers dynamic conv step {i} max abs {err}"
+        );
+    }
 }

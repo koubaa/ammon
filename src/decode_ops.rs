@@ -72,141 +72,107 @@ fn head_l2_clip(
     }
 }
 
-/// `out = cap * tanh(x / cap)`.
+/// Device `tanh` and `sigmoid`, each defined once.
 ///
-/// For `|z| < 0.5`, `tanh` is the odd Taylor series through `z^11`. The
-/// `exp` form cancels near zero. Outside that, `z >= 0` uses
-/// `(1 - e^{-2z}) / (1 + e^{-2z})` and `z < 0` uses `(e^{2z} - 1) / (e^{2z} + 1)`.
-/// Replace this with `goldy::gpu::tanh` once that builtin matches libm for
-/// small `z` (it does not, as of goldy `83052da`). Keep the three copies
-/// (here and both softcaps in `softcapped_swiglu`) on the same series.
-#[goldy::compute(workgroup_size = [256, 1, 1])]
-fn softcap(
-    #[tensor(shape = [n])] x: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [n])] out: goldy::gpu::TensorWrite<f32>,
-    cap: f32,
-) {
-    let i = goldy::gpu::global_id().x;
-    if i >= x.len() {
-        return;
-    }
-    let z = x[i] / cap;
-    let mut az = z;
-    if az < 0.0 {
-        az = -az;
-    }
-    let mut t = 0.0;
-    if az < 0.5 {
-        let z2 = z * z;
-        t = z
-            * (1.0
-                + z2 * ((-1.0 / 3.0)
-                    + z2 * ((2.0 / 15.0)
-                        + z2 * ((-17.0 / 315.0)
-                            + z2 * ((62.0 / 2835.0) + z2 * (-1382.0 / 155925.0))))));
-    } else if z >= 0.0 {
-        let e = goldy::gpu::exp(-2.0 * z);
-        t = (1.0 - e) / (1.0 + e);
-    } else {
-        let e = goldy::gpu::exp(2.0 * z);
-        t = (e - 1.0) / (e + 1.0);
-    }
-    out[i] = t * cap;
+/// `|z| < 0.5` uses the odd Taylor series of `tanh` through `z^11`. The
+/// `exp` form cancels near zero. After
+/// [koubaa/goldy#332](https://github.com/koubaa/goldy/pull/332) merges builtins
+/// that match libm for small `z`, replace the two `@tanh` / `@sigmoid` arms
+/// below with `goldy::gpu::tanh` and `goldy::gpu::sigmoid`, and bump `GOLDY_REF`.
+macro_rules! pointwise_kernels {
+    (fn $name:ident ( $($sig:tt)* ) { $($body:tt)* } $($rest:tt)*) => {
+        pointwise_kernels!(@fn $name ( $($sig)* ) {} $($body)*);
+        pointwise_kernels!($($rest)*);
+    };
+    () => {};
+
+    (@fn $name:ident ( $($sig:tt)* ) { $($acc:tt)* } tanh $dest:ident ($zn:ident $azn:ident $z2n:ident $en:ident) = $z:expr; $($tail:tt)*) => {
+        pointwise_kernels!(@fn $name ( $($sig)* ) {
+            $($acc)*
+            let $zn = $z;
+            let mut $azn = $zn;
+            if $azn < 0.0 {
+                $azn = -$azn;
+            }
+            let mut $dest = 0.0;
+            if $azn < 0.5 {
+                let $z2n = $zn * $zn;
+                $dest = $zn * (1.0 + $z2n * ((-1.0 / 3.0) + $z2n * ((2.0 / 15.0) + $z2n * ((-17.0 / 315.0) + $z2n * ((62.0 / 2835.0) + $z2n * (-1382.0 / 155925.0))))));
+            } else if $zn >= 0.0 {
+                let $en = goldy::gpu::exp(-2.0 * $zn);
+                $dest = (1.0 - $en) / (1.0 + $en);
+            } else {
+                let $en = goldy::gpu::exp(2.0 * $zn);
+                $dest = ($en - 1.0) / ($en + 1.0);
+            }
+        } $($tail)*);
+    };
+    (@fn $name:ident ( $($sig:tt)* ) { $($acc:tt)* } sigmoid $dest:ident ($zn:ident $en:ident) = $z:expr; $($tail:tt)*) => {
+        pointwise_kernels!(@fn $name ( $($sig)* ) {
+            $($acc)*
+            let $zn = $z;
+            let mut $dest = 0.0;
+            if $zn >= 0.0 {
+                $dest = 1.0 / (1.0 + goldy::gpu::exp(-$zn));
+            } else {
+                let $en = goldy::gpu::exp($zn);
+                $dest = $en / (1.0 + $en);
+            }
+        } $($tail)*);
+    };
+    (@fn $name:ident ( $($sig:tt)* ) { $($acc:tt)* } raw { $($stmt:tt)* } $($tail:tt)*) => {
+        pointwise_kernels!(@fn $name ( $($sig)* ) { $($acc)* $($stmt)* } $($tail)*);
+    };
+    (@fn $name:ident ( $($sig:tt)* ) { $($acc:tt)* }) => {
+        #[goldy::compute(workgroup_size = [256, 1, 1])]
+        fn $name( $($sig)* ) { $($acc)* }
+    };
 }
 
-/// `values *= sigmoid(logits)`, elementwise.
-///
-/// Stable sigmoid: `1 / (1 + e^{-z})` for `z >= 0`, else `e^{z} / (1 + e^{z})`.
-/// Replace with `goldy::gpu::sigmoid` when that builtin exists.
-#[goldy::compute(workgroup_size = [256, 1, 1])]
-fn sigmoid_gate(
-    #[tensor(shape = [n])] values: goldy::gpu::TensorMut<f32>,
-    #[tensor(shape = [n])] logits: goldy::gpu::Tensor<f32>,
-) {
-    let i = goldy::gpu::global_id().x;
-    if i >= values.len() {
-        return;
+pointwise_kernels! {
+    fn softcap(
+        #[tensor(shape = [n])] x: goldy::gpu::Tensor<f32>,
+        #[tensor(shape = [n])] out: goldy::gpu::TensorWrite<f32>,
+        cap: f32,
+    ) {
+        raw {
+            let i = goldy::gpu::global_id().x;
+            if i >= x.len() { return; }
+        }
+        tanh t (zt azt z2t et) = x[i] / cap;
+        raw { out[i] = t * cap; }
     }
-    let z = logits[i];
-    let mut s = 0.0;
-    if z >= 0.0 {
-        s = 1.0 / (1.0 + goldy::gpu::exp(-z));
-    } else {
-        let e = goldy::gpu::exp(z);
-        s = e / (1.0 + e);
-    }
-    values[i] = values[i] * s;
-}
 
-/// `out = softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap)`.
-///
-/// `sigmoid` sees the raw gate. Both softcaps use the same `tanh` as
-/// [`softcap`], including the small-`z` series. Replace them with
-/// `goldy::gpu::tanh` and `goldy::gpu::sigmoid` when those builtins are precise.
-#[goldy::compute(workgroup_size = [256, 1, 1])]
-fn softcapped_swiglu(
-    #[tensor(shape = [n])] gate: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [n])] up: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [n])] out: goldy::gpu::TensorWrite<f32>,
-    gate_cap: f32,
-    up_cap: f32,
-) {
-    let i = goldy::gpu::global_id().x;
-    if i >= gate.len() {
-        return;
+    fn sigmoid_gate(
+        #[tensor(shape = [n])] values: goldy::gpu::TensorMut<f32>,
+        #[tensor(shape = [n])] logits: goldy::gpu::Tensor<f32>,
+    ) {
+        raw {
+            let i = goldy::gpu::global_id().x;
+            if i >= values.len() { return; }
+        }
+        sigmoid s (zs es) = logits[i];
+        raw { values[i] = values[i] * s; }
     }
-    let g = gate[i];
-    let u = up[i];
-    let gz = g / gate_cap;
-    let mut gaz = gz;
-    if gaz < 0.0 {
-        gaz = -gaz;
+
+    fn softcapped_swiglu(
+        #[tensor(shape = [n])] gate: goldy::gpu::Tensor<f32>,
+        #[tensor(shape = [n])] up: goldy::gpu::Tensor<f32>,
+        #[tensor(shape = [n])] out: goldy::gpu::TensorWrite<f32>,
+        gate_cap: f32,
+        up_cap: f32,
+    ) {
+        raw {
+            let i = goldy::gpu::global_id().x;
+            if i >= gate.len() { return; }
+            let g = gate[i];
+            let u = up[i];
+        }
+        tanh gt (zgt azgt z2gt egt) = g / gate_cap;
+        tanh ut (zut azut z2ut eut) = u / up_cap;
+        sigmoid s (zs es) = g;
+        raw { out[i] = (gt * gate_cap) * s * (ut * up_cap); }
     }
-    let mut gt = 0.0;
-    if gaz < 0.5 {
-        let z2 = gz * gz;
-        gt = gz
-            * (1.0
-                + z2 * ((-1.0 / 3.0)
-                    + z2 * ((2.0 / 15.0)
-                        + z2 * ((-17.0 / 315.0)
-                            + z2 * ((62.0 / 2835.0) + z2 * (-1382.0 / 155925.0))))));
-    } else if gz >= 0.0 {
-        let e = goldy::gpu::exp(-2.0 * gz);
-        gt = (1.0 - e) / (1.0 + e);
-    } else {
-        let e = goldy::gpu::exp(2.0 * gz);
-        gt = (e - 1.0) / (e + 1.0);
-    }
-    let uz = u / up_cap;
-    let mut uaz = uz;
-    if uaz < 0.0 {
-        uaz = -uaz;
-    }
-    let mut ut = 0.0;
-    if uaz < 0.5 {
-        let z2 = uz * uz;
-        ut = uz
-            * (1.0
-                + z2 * ((-1.0 / 3.0)
-                    + z2 * ((2.0 / 15.0)
-                        + z2 * ((-17.0 / 315.0)
-                            + z2 * ((62.0 / 2835.0) + z2 * (-1382.0 / 155925.0))))));
-    } else if uz >= 0.0 {
-        let e = goldy::gpu::exp(-2.0 * uz);
-        ut = (1.0 - e) / (1.0 + e);
-    } else {
-        let e = goldy::gpu::exp(2.0 * uz);
-        ut = (e - 1.0) / (e + 1.0);
-    }
-    let mut s = 0.0;
-    if g >= 0.0 {
-        s = 1.0 / (1.0 + goldy::gpu::exp(-g));
-    } else {
-        let e = goldy::gpu::exp(g);
-        s = e / (1.0 + e);
-    }
-    out[i] = (gt * gate_cap) * s * (ut * up_cap);
 }
 
 /// One-token static causal depthwise convolution.
