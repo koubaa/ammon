@@ -5,9 +5,9 @@
 # or does not advertise Vulkan 1.4.
 #
 # Bump GOLDY_REF when ammon should build against a newer goldy. Change only
-# that value; the checkout step reads it. The current pin is goldy#338
-# (`matmul_indexed_into`: a device u32 id selects a weight slab, then the
-# ordinary matmul lowering runs).
+# that value; the checkout step reads it. The pin is goldy main
+# (6aeaa153, merge of #338). `matmul_indexed_into` selects a weight slab
+# with a device u32 id, then the ordinary matmul lowering runs.
 
 name: CI
 
@@ -17,7 +17,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: f1289f8721566b7a9d38a44b49b97c33c8ac5308
+  GOLDY_REF: 6aeaa15355e7265e7f9a486410d7bf16e49a6c97
 
 jobs:
   test:
