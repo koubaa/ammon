@@ -1,5 +1,6 @@
 //! Inference operators and decode control on Goldy. Not a training runtime.
 
+pub mod checkpoint;
 pub mod generate;
 pub mod model;
 pub mod tokenizer;
@@ -24,7 +25,8 @@ mod moe;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
-    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DepthPlan, DepthRunner,
+    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DepthMix, DepthPlan,
+    DepthRunner,
     DynamicShortConv, Embedding, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm,
     ShortConv, SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights,
     DEFAULT_RMS_EPS,

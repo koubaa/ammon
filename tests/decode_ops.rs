@@ -209,6 +209,62 @@ fn softcapped_swiglu_matches_cpu_reference() {
 }
 
 #[test]
+fn short_conv_at_replays_the_same_position_without_shifting() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let conv = ShortConv::new(&device, 1, 2).unwrap();
+    let weight = Tensor::from_f32(&device, TensorShape::matrix(1, 2), &[3.0, 5.0]).unwrap();
+    let x = Tensor::zeros(&device, TensorShape::vector(1), TensorDType::F32).unwrap();
+    let out = Tensor::zeros(&device, TensorShape::vector(1), TensorDType::F32).unwrap();
+    let step = step_buf(&device, 0);
+    let mut recorded = Scheme::new(&ctx);
+    conv.record_at(&mut recorded, x.view(), weight.view(), &step, out.view())
+        .unwrap();
+    x.buffer()
+        .write(0, bytemuck::cast_slice(&[2.0f32]))
+        .unwrap();
+    step.write(
+        0,
+        bytemuck::bytes_of(&DecodeStep {
+            token: 0,
+            position: 0,
+        }),
+    )
+    .unwrap();
+    let _ = recorded.submit().unwrap();
+    x.buffer()
+        .write(0, bytemuck::cast_slice(&[7.0f32]))
+        .unwrap();
+    step.write(
+        0,
+        bytemuck::bytes_of(&DecodeStep {
+            token: 0,
+            position: 1,
+        }),
+    )
+    .unwrap();
+    let _ = recorded.submit().unwrap();
+    let once = read_f32(&mut recorded, out.buffer());
+    x.buffer()
+        .write(0, bytemuck::cast_slice(&[7.0f32]))
+        .unwrap();
+    step.write(
+        0,
+        bytemuck::bytes_of(&DecodeStep {
+            token: 0,
+            position: 1,
+        }),
+    )
+    .unwrap();
+    let _ = recorded.submit().unwrap();
+    let again = read_f32(&mut recorded, out.buffer());
+    assert!(
+        max_abs(&once, &again) < 1e-6,
+        "replay shifted the conv ring: {once:?} vs {again:?}"
+    );
+}
+
+#[test]
 fn short_conv_matches_cpu_reference_and_resets() {
     let device = runtime();
     let ctx = device.create_context().unwrap();

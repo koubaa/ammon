@@ -14,7 +14,7 @@
 fn moe_topk(
     #[tensor(shape = [n])] logits: goldy::gpu::Tensor<f32>,
     #[tensor(shape = [n])] bias: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [k])] ids: goldy::gpu::TensorMut<f32>,
+    #[tensor(shape = [k])] ids: goldy::gpu::TensorMut<u32>,
     #[tensor(shape = [k])] weights: goldy::gpu::TensorMut<f32>,
     route_scale: f32,
 ) {
@@ -32,7 +32,7 @@ fn moe_topk(
             let mut taken = 0u32;
             let mut p = 0u32;
             while p < pass {
-                if (ids[p] as u32) == i {
+                if ids[p] == i {
                     taken = 1;
                 }
                 p = p + 1;
@@ -74,7 +74,7 @@ fn moe_topk(
             step = step / 2;
         }
         if local == 0 {
-            ids[pass] = index[0];
+            ids[pass] = index[0] as u32;
         }
         goldy::gpu::workgroup_barrier();
         pass = pass + 1;
@@ -82,7 +82,7 @@ fn moe_topk(
     if local == 0 {
         let mut i = 0u32;
         while i < k {
-            let id = ids[i] as u32;
+            let id = ids[i];
             weights[i] = goldy::gpu::sigmoid(logits[id]);
             i = i + 1;
         }
