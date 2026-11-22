@@ -115,44 +115,64 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
             None,
         )
     };
+    let q_t = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
+    let k_t = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
+    let v_t = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
     let out = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
-    for (i, (q, k, v, y)) in steps.iter().enumerate() {
-        let q_t = Tensor::from_f32(&device, TensorShape::vector(spec.hidden), q).unwrap();
-        let k_t = Tensor::from_f32(&device, TensorShape::vector(spec.hidden), k).unwrap();
-        let v_t = Tensor::from_f32(&device, TensorShape::vector(spec.hidden), v).unwrap();
-        let step = step_buf(&device, i as u32);
-        let mut scheme = Scheme::new(&ctx);
-        let weights = DecodeAttentionWeights {
-            wq: wq.view(),
-            wk: wk.view(),
-            wv: wv.view(),
-            wo: wo.view(),
-            wgate: wgate.view(),
-            wsink: wsink.view(),
-            wrel: wrel.view(),
-            rel_proj: rel_proj.view(),
-            q_scale: q_scale.view(),
-            rel_scale: rel_scale.view(),
-            k_conv: k_conv.view(),
-            v_conv: v_conv.view(),
-            k_conv_proj: k_proj.as_ref().map(Tensor::view),
-            v_conv_proj: v_proj.as_ref().map(Tensor::view),
-        };
-        attn.record(
-            &mut scheme,
-            q_t.view(),
-            k_t.view(),
-            v_t.view(),
-            weights,
-            &cache,
-            &step,
-            out.view(),
-        )
+    let step = step_buf(&device, 0);
+    let mut recorded = Scheme::new(&ctx);
+    let weights = DecodeAttentionWeights {
+        wq: wq.view(),
+        wk: wk.view(),
+        wv: wv.view(),
+        wo: wo.view(),
+        wgate: wgate.view(),
+        wsink: wsink.view(),
+        wrel: wrel.view(),
+        rel_proj: rel_proj.view(),
+        q_scale: q_scale.view(),
+        rel_scale: rel_scale.view(),
+        k_conv: k_conv.view(),
+        v_conv: v_conv.view(),
+        k_conv_proj: k_proj.as_ref().map(Tensor::view),
+        v_conv_proj: v_proj.as_ref().map(Tensor::view),
+    };
+    attn.record(
+        &mut recorded,
+        q_t.view(),
+        k_t.view(),
+        v_t.view(),
+        weights,
+        &cache,
+        &step,
+        out.view(),
+    )
+    .unwrap();
+    let mut upload = Scheme::new(&ctx);
+    let deposit = MemoryExchange::new(&ctx)
+        .bind_deposit(&mut upload, DecodeStep::deposit_target(&step))
         .unwrap();
-        let got = read_f32(&mut scheme, out.buffer());
+    for (i, (q, k, v, y)) in steps.iter().enumerate() {
+        q_t.buffer().write(0, bytemuck::cast_slice(q)).unwrap();
+        k_t.buffer().write(0, bytemuck::cast_slice(k)).unwrap();
+        v_t.buffer().write(0, bytemuck::cast_slice(v)).unwrap();
+        cache.deposit_position(&deposit, 0, i as u32).unwrap();
+        let _ = upload.submit().unwrap();
+        let _ = recorded.submit().unwrap();
+        let mut read = Scheme::new(&ctx);
+        let got = read_f32(&mut read, out.buffer());
         let err = max_abs(&got, y);
         assert!(err <= 1e-5, "step {i} max abs {err} got {got:?} want {y:?}");
     }
+    let stats = recorded.replay_stats();
+    assert_eq!(
+        stats.topology_records, 0,
+        "replay changed scheme topology: {stats:?}"
+    );
+    assert!(
+        stats.clean_submits > 0,
+        "no clean replay submits: {stats:?}"
+    );
 }
 
 struct Weights<'a> {
@@ -526,6 +546,12 @@ fn full_cache_replay_past_capacity_does_not_write() {
         let got = read_f32(&mut read, cache.keys().buffer());
         if position == 5 {
             assert_eq!(got, after_zero, "a replay past capacity must not store");
+            let mut read = Scheme::new(&ctx);
+            let out_got = read_f32(&mut read, out.buffer());
+            assert!(
+                out_got.iter().all(|v| v.is_nan()),
+                "past-capacity attention writes NaN, got {out_got:?}"
+            );
         } else {
             assert_ne!(
                 got, after_zero,

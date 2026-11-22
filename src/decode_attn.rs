@@ -49,6 +49,9 @@ fn kv_cache_store(
     let pos = step[0].position;
     let capacity = key_cache.dim(0);
     // Same rule as `cache_slot`. Inlined because a shader body cannot call it.
+    // A full-cache position past the allocation does not write. The host check
+    // is `DecodeKvCache::deposit_position`; this is the guard for a replay
+    // that deposits the step after `record`.
     let mut slot = pos;
     if window != 0 {
         slot = pos % capacity;
@@ -90,6 +93,17 @@ fn relative_attention(
     let groups = q.dim(0) / kv_heads;
     let kv_head = h / groups;
     let pos = step[0].position;
+
+    // Past the full-cache allocation: do not read those rows. The head output
+    // is NaN so the fault is visible after the output projection.
+    if window == 0 {
+        if pos >= capacity {
+            if local < head {
+                out[h * head + local] = 0.0 / 0.0;
+            }
+            return;
+        }
+    }
 
     let mut n = pos + 1;
     let mut start = 0u32;

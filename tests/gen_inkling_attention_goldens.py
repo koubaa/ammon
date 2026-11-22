@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit decode-attention goldens from the pinned transformers attention classes.
+"""Emit decode-attention goldens from one uncached forward of the pinned classes.
 
 Source: transformers commit eeee11099135592f1d03c2871fbd3d8132e5a4d7
 `src/transformers/models/inkling2/modeling_inkling2.py`.
@@ -48,61 +48,6 @@ def load_attention(path: str):
     return ns
 
 
-class StepCache:
-    """Conv state plus the HF sliding/full KV update used by one attention layer."""
-
-    def __init__(self, window):
-        self.window = window
-        self.conv_states = {}
-        self.ready = set()
-        self.seen = set()
-        self.kernel = {}
-        self.keys = None
-        self.values = None
-        self.cumulative = 0
-        self.is_initialized = False
-
-    def is_recording_past(self, _layer):
-        return False
-
-    def get_conv_state(self, layer, state_idx=0):
-        return self.conv_states.get((layer, state_idx))
-
-    def update_conv_state(self, conv_states, layer, state_idx=0, conv_kernel_size=None):
-        key = (layer, state_idx)
-        if key not in self.ready:
-            k = conv_kernel_size if conv_kernel_size is not None else conv_states.shape[-1]
-            self.kernel[key] = k
-            self.conv_states[key] = torch.zeros(*conv_states.shape[:-1], k)
-            self.ready.add(key)
-            self.seen.discard(key)
-        if key not in self.seen:
-            full = conv_states
-            self.seen.add(key)
-            if full.shape[-1] < self.kernel[key]:
-                full = F.pad(full, (self.kernel[key] - full.shape[-1], 0))
-        else:
-            full = torch.cat([self.conv_states[key], conv_states], dim=-1)
-        self.conv_states[key] = full[..., -self.kernel[key] :].clone()
-        return full
-
-    def update(self, key_states, value_states, *_args, **_kwargs):
-        if not self.is_initialized:
-            self.keys = torch.tensor([], dtype=key_states.dtype)
-            self.values = torch.tensor([], dtype=value_states.dtype)
-            self.is_initialized = True
-        self.cumulative += key_states.shape[-2]
-        full_k = torch.cat([self.keys, key_states], dim=-2)
-        full_v = torch.cat([self.values, value_states], dim=-2)
-        if self.window is None:
-            self.keys, self.values = full_k, full_v
-        else:
-            keep = self.window - 1
-            self.keys = full_k[:, :, -keep:, :]
-            self.values = full_v[:, :, -keep:, :]
-        return full_k, full_v
-
-
 def f32s(t):
     return [float(v) for v in t.detach().float().reshape(-1).tolist()]
 
@@ -144,41 +89,46 @@ def fill(module):
             p.copy_(torch.empty_like(p).normal_(0.0, 0.35))
 
 
-def relative_distance(past, q_len, window):
-    if window is None:
-        kv_offset = 0
-        kv_length = past + q_len
-    else:
-        kv_offset = max(past - window + 1, 0)
-        kv_length = window - 1 + q_len if past >= window else past + q_len
-    q = torch.arange(q_len) + past
-    kv = torch.arange(kv_length) + kv_offset
-    return q[:, None] - kv[None, :]
-
-
 def run_case(ns, cls, cfg, steps, window, layer_idx):
+    """One uncached full-sequence forward of the pinned attention class.
+
+    Token ``t`` of that forward is the decode step after feeding tokens
+    ``0..=t``. The mask is the HF inequality (causal, and the window when
+    set). No hand-rolled KV cache is involved.
+    """
     torch.manual_seed(cfg.seed)
     module = cls(cfg, layer_idx)
     fill(module)
-    cache = StepCache(window)
     hidden = cfg.hidden_size
-    rows = []
-    for past in range(steps):
-        q = torch.randn(1, 1, hidden)
-        k = q if window is not None else torch.randn(1, 1, hidden)
-        v = q if window is not None else torch.randn(1, 1, hidden)
-        dist = relative_distance(past, 1, window)
-        pos = torch.tensor([[past]])
-        y, _ = module(
-            q,
-            attention_mask=None,
-            relative_distance=dist,
-            cache=cache,
-            key_hidden_states=k,
-            value_hidden_states=v,
-            position_ids=pos,
-        )
-        rows.append((f32s(q), f32s(k), f32s(v), f32s(y)))
+    q = torch.randn(1, steps, hidden)
+    if window is None:
+        k = torch.randn(1, steps, hidden)
+        v = torch.randn(1, steps, hidden)
+    else:
+        k = q
+        v = q
+    pos = torch.arange(steps)
+    dist = pos[:, None] - pos[None, :]
+    keep = pos[None, :] <= pos[:, None]
+    if window is not None:
+        keep = keep & (pos[:, None] - window < pos[None, :])
+    mask = torch.where(
+        keep,
+        torch.zeros((), dtype=torch.float32),
+        torch.full((), torch.finfo(torch.float32).min),
+    )
+    y, _ = module(
+        q,
+        attention_mask=mask.view(1, 1, steps, steps),
+        relative_distance=dist,
+        cache=None,
+        key_hidden_states=k,
+        value_hidden_states=v,
+        position_ids=pos.view(1, steps),
+    )
+    rows = [
+        (f32s(q[0, t]), f32s(k[0, t]), f32s(v[0, t]), f32s(y[0, t])) for t in range(steps)
+    ]
     return module, rows
 
 

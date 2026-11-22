@@ -807,11 +807,32 @@ impl DecodeKvCache {
         self.kind
     }
 
+    /// Zeros the stored keys and values.
+    ///
+    /// Not required between sequences. Which rows are read depends only on
+    /// `DecodeStep.position`, and a new sequence rewrites every row it reads.
     pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
         self.blocks
             .record_zero(scheme, "kv_reset_k", self.key.view())?;
         self.blocks
             .record_zero(scheme, "kv_reset_v", self.value.view())
+    }
+
+    /// Deposit `DecodeStep { token, position }` after [`Self::check_position`].
+    ///
+    /// This is the host check for a full cache. `record` does not see the
+    /// position, because a consumer records once and deposits a new step per
+    /// token. The kernels still refuse a position past `capacity`: the store
+    /// skips the write, and attention writes NaN instead of reading past the
+    /// allocation.
+    pub fn deposit_position(
+        &self,
+        deposit: &goldy::DepositTransaction,
+        token: u32,
+        position: u32,
+    ) -> Result<(), GoldyError> {
+        self.check_position(position)?;
+        deposit.write_data(0, &[crate::kernels::DecodeStep { token, position }])
     }
 
     pub fn keys(&self) -> TensorView<'_> {
@@ -950,6 +971,11 @@ impl DecodeAttention {
         match kind {
             DecodeAttentionKind::Sliding { window } if window == 0 => {
                 anyhow::bail!("sliding attention window must be non-zero");
+            }
+            DecodeAttentionKind::Sliding { window } if rel_extent != window => {
+                anyhow::bail!(
+                    "sliding attention rel_extent {rel_extent} must equal the window {window}"
+                );
             }
             DecodeAttentionKind::Full { capacity } if capacity == 0 => {
                 anyhow::bail!("full attention capacity must be non-zero");
