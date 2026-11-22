@@ -492,16 +492,18 @@ impl Blocks {
         x: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.tensors.recorder(scheme).matmul_nvfp4_indexed_into(
+        self.tensors.recorder(scheme).matmul_block_scaled_into(
             label,
-            goldy::Nvfp4Experts {
+            goldy::BlockScaled {
                 codes,
                 scales,
-                factors,
-                ids,
-                slot,
+                elems: goldy::ops::PackedElem::E2M1,
+                scale: goldy::ops::PackedScale::E4M3,
+                block: [1, 16],
+                global: Some(factors),
             },
             x,
+            Some((ids, slot)),
             out,
         )
     }

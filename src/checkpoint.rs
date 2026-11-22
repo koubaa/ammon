@@ -3,8 +3,10 @@
 //! Names, dtypes, and shapes are returned as stored. Callers decide which names
 //! they understand. [`TensorEntry::upload_f32`] copies an F32 payload.
 //! [`MappedCheckpoint`] memory-maps the file and uploads packed dtypes
-//! (BF16, U8, F8_E4M3, F32) without expanding them to FP32.
+//! (BF16, U8, F8_E4M3, F32) without expanding them to FP32. The upload
+//! stages those bytes; it does not keep a second decoded matrix.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -89,10 +91,12 @@ pub struct MappedTensor {
 pub struct MappedCheckpoint {
     mmap: memmap2::Mmap,
     tensors: Vec<MappedTensor>,
+    index: HashMap<String, usize>,
 }
 
 impl MappedCheckpoint {
-    /// Map `path` and read the header. The file is not copied.
+    /// Map `path` and read the header. Tensor payloads stay in the mapping
+    /// until [`Self::upload`], which stages the stored bytes.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         // Read-only map. Callers do not write the file while it is open.
@@ -117,7 +121,16 @@ impl MappedCheckpoint {
             });
         }
         tensors.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Self { mmap, tensors })
+        let index = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, tensor)| (tensor.name.clone(), i))
+            .collect();
+        Ok(Self {
+            mmap,
+            tensors,
+            index,
+        })
     }
 
     pub fn tensors(&self) -> &[MappedTensor] {
@@ -125,9 +138,9 @@ impl MappedCheckpoint {
     }
 
     pub fn get(&self, name: &str) -> Result<&MappedTensor> {
-        self.tensors
-            .iter()
-            .find(|tensor| tensor.name == name)
+        self.index
+            .get(name)
+            .map(|i| &self.tensors[*i])
             .ok_or_else(|| anyhow::anyhow!("missing tensor `{name}`"))
     }
 
