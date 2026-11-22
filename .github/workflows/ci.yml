@@ -78,7 +78,7 @@ jobs:
 
       - name: Host tests
         working-directory: ammon
-        run: cargo test --lib
+        run: cargo test --lib && cargo check --features hf-tokenizer
 
       - name: Vulkan tests
         working-directory: ammon
