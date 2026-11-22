@@ -955,9 +955,11 @@ pub struct DecodeLayerState {
     kernel: u32,
     /// Post-attention and post-MLP conv rings. Present after [`Self::with_post_conv`].
     ///
-    /// `partial` is `[q_heads, attended.div_ceil(8), head_dim + 2]`. `attended`
-    /// is the sliding window, or the full-cache capacity. The extra two lanes
-    /// are the running max and the sum of exp for split-K combine.
+    /// `partial` is `[q_heads, splits, head_dim + 2]`. `splits` is
+    /// `min(32, attended.div_ceil(8))`. `attended` is the sliding window, or
+    /// the full-cache capacity. Past 256 positions a split loops 8-token
+    /// chunks, so the scratch does not grow with context. The extra two lanes
+    /// are the running max and the sum of exp.
     post_attn: Option<Tensor>,
     post_mlp: Option<Tensor>,
 }
@@ -1009,7 +1011,7 @@ impl DecodeLayerState {
             anyhow::bail!("decode state needs a kernel and query heads");
         }
         let kv_dim = kv.kv_heads * kv.head_dim;
-        let splits = attended.div_ceil(8).max(1);
+        let splits = crate::blocks::attention_splits(attended);
         let f = TensorDType::F32;
         Ok(Self {
             k_conv: Tensor::zeros(runtime, TensorShape::matrix(kv_dim, kernel), f)?,

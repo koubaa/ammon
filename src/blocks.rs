@@ -15,8 +15,8 @@ use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::kernels::{
     AttentionCombineKernel, AttentionPartialKernel, CacheStoreKernel, EmbedKernel,
     RmsnormInplaceKernel, RmsnormKernel, RmsnormUnweightedInplaceKernel, RmsnormUnweightedKernel,
-    RopeStoreKernel, SwigluKernel, TensorKernels, ATTENTION_MAX_HEAD, ATTENTION_SPLIT,
-    DEFAULT_ROPE_THETA,
+    RopeStoreKernel, SwigluKernel, TensorKernels, ATTENTION_MAX_HEAD, ATTENTION_MAX_SPLITS,
+    ATTENTION_SPLIT, DEFAULT_ROPE_THETA,
 };
 use crate::moe::{MoeDownAccumKernel, MoeGateUpKernel, MoeTopkKernel};
 use anyhow::Context;
@@ -506,6 +506,12 @@ impl Blocks {
         cap: f32,
     ) -> Result<(), GoldyError> {
         let mut rec = self.tensors.recorder(scheme);
+        // `tanh(x / 1) * 1` is `tanh(x)`. One op keeps a message gate inside the
+        // 16-resource fusion limit.
+        if cap == 1.0 {
+            rec.tanh_into("softcap", x, out)?;
+            return Ok(());
+        }
         let scaled = rec.div_scalar("softcap_div", x, cap)?;
         let curved = rec.tanh("softcap_tanh", scaled.view())?;
         rec.mul_scalar_into("softcap", curved.view(), cap, out)?;
@@ -942,7 +948,10 @@ impl Blocks {
 
 /// Flash-decoding splits covering `seq_len` cached positions.
 pub(crate) fn attention_splits(seq_len: u32) -> u32 {
-    seq_len.div_ceil(ATTENTION_SPLIT).max(1)
+    seq_len
+        .div_ceil(ATTENTION_SPLIT)
+        .max(1)
+        .min(ATTENTION_MAX_SPLITS)
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Weak<Blocks>)>>> = OnceLock::new();
@@ -950,6 +959,15 @@ static CACHE: OnceLock<Mutex<Vec<(usize, Weak<Blocks>)>>> = OnceLock::new();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_splits_cap_a_long_context() {
+        assert_eq!(attention_splits(8), 1);
+        assert_eq!(attention_splits(64), 8);
+        assert_eq!(attention_splits(256), 32);
+        assert_eq!(attention_splits(8_192), 32);
+    }
+
     use goldy::{Tensor, TensorDType, TensorShape};
 
     /// Clears `AMMON_SEMANTIC_NORM` on drop, including after a panic.
