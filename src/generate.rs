@@ -129,8 +129,7 @@ fn logit_margin(logits: &[f32]) -> f32 {
 
 /// Teacher-force `prompt`, then append `max_new` greedy tokens.
 ///
-/// The model view is dropped before the next step so the device buffer can
-/// be written again.
+/// `step` returns owned logits, so the next step can write the device buffer.
 pub fn greedy_decode<M: AutoregressiveModel>(
     model: &mut M,
     prompt: &[u32],
@@ -143,13 +142,12 @@ pub fn greedy_decode<M: AutoregressiveModel>(
     let mut logits = model.step(prompt[0], 0)?;
     step_secs.push(step_started.elapsed().as_secs_f64());
     for (index, token) in prompt.iter().enumerate().skip(1) {
-        drop(logits);
         let step_started = Instant::now();
         logits = model.step(*token, index as u32)?;
         step_secs.push(step_started.elapsed().as_secs_f64());
     }
     let prefill_secs = started.elapsed().as_secs_f64();
-    let last_logits = logits.to_vec();
+    let last_logits = logits.clone();
     let mut new_tokens = Vec::with_capacity(max_new as usize);
     let mut margins = Vec::with_capacity(max_new as usize);
     let mut pos = prompt.len() as u32;
@@ -158,7 +156,6 @@ pub fn greedy_decode<M: AutoregressiveModel>(
     for step in 0..max_new {
         let next = sample_argmax(&logits);
         margins.push(logit_margin(&logits));
-        drop(logits);
         anyhow::ensure!(next >= 0, "argmax returned {next}");
         new_tokens.push(next as u32);
         if step + 1 == max_new {

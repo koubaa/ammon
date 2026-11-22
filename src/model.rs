@@ -7,5 +7,7 @@ use anyhow::Result;
 pub trait AutoregressiveModel {
     fn vocab_size(&self) -> usize;
     fn max_seq_len(&self) -> u32;
-    fn step(&mut self, token: u32, pos: u32) -> Result<goldy::HostView<f32>>;
+    /// Logits for `token` at absolute position `pos`. The returned vector owns
+    /// the values, so the next call may write the device buffer.
+    fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>>;
 }
