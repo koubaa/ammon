@@ -7,6 +7,8 @@ pub mod tokenizer;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod blocks;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+mod decode_attn;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod decode_ops;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod gpu;
@@ -17,9 +19,10 @@ pub mod modules;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
-    CausalAttentionBlock, CausalAttentionBlockWeights, DynamicShortConv, Embedding, HeadL2Clip,
-    KvCache, KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv, SigmoidGate, Softcap,
-    SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
+    CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
+    DecodeAttentionWeights, DecodeKvCache, DynamicShortConv, Embedding, HeadL2Clip, KvCache,
+    KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv, SigmoidGate, Softcap, SoftcappedSwiGlu,
+    SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
 };
 
 pub use generate::{
