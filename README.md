@@ -22,6 +22,14 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 - The submitting worker scheme or its memory exchange
 - Host compatibility patches (dream-prompt rewrite, CJK `safe_printf`)
 
+## API notes
+
+`RmsnormKernel::record` and `RmsnormInplaceKernel::record` take a trailing `eps: f32`. That is a source break for anyone calling those kernels directly. `RmsNorm::new`, `RmsNorm::record`, `RmsNorm::record_inplace`, and the pre-norm block `new` constructors are unchanged and still use `DEFAULT_RMS_EPS` (`1e-5`). Pass another epsilon with `with_eps`.
+
+## CI goldy pin
+
+`.github/workflows/ci.yml` sets `GOLDY_REF` (currently `83052da5debfdb8a2217981bdf84fd223d785ea5`). Ammon depends on Goldy by path (`../goldy`), so CI checks that commit out beside this repo. To move the pin, change only `GOLDY_REF` and push. Do that when `goldy::gpu::tanh` and `goldy::gpu::sigmoid` are accurate for small inputs ([koubaa/goldy#332](https://github.com/koubaa/goldy/pull/332)); the decode kernels still expand both from `exp` until then.
+
 ## Tests
 
 ```bash
