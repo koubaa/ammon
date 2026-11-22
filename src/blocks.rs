@@ -11,6 +11,7 @@ use crate::decode_ops::{
     DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
     SoftcappedSwiGluKernel,
 };
+use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::kernels::{
     AttentionCombineKernel, AttentionPartialKernel, CacheStoreKernel, EmbedKernel,
     RmsnormInplaceKernel, RmsnormKernel, RmsnormUnweightedInplaceKernel, RmsnormUnweightedKernel,
@@ -50,6 +51,9 @@ pub(crate) struct Blocks {
     moe_topk: MoeTopkKernel,
     moe_gate_up: MoeGateUpKernel,
     moe_down_accum: MoeDownAccumKernel,
+    depth_store: DepthStoreKernel,
+    depth_copy_rows: DepthCopyRowsKernel,
+    depth_mix: DepthMixKernel,
 }
 
 /// Activation and weight views for one attention block.
@@ -155,6 +159,11 @@ impl Blocks {
             moe_gate_up: MoeGateUpKernel::prepare(runtime).context("prepare moe_gate_up kernel")?,
             moe_down_accum: MoeDownAccumKernel::prepare(runtime)
                 .context("prepare moe_down_accum kernel")?,
+            depth_store: DepthStoreKernel::prepare(runtime)
+                .context("prepare depth_store kernel")?,
+            depth_copy_rows: DepthCopyRowsKernel::prepare(runtime)
+                .context("prepare depth_copy_rows kernel")?,
+            depth_mix: DepthMixKernel::prepare(runtime).context("prepare depth_mix kernel")?,
         })
     }
 
@@ -696,6 +705,72 @@ impl Blocks {
                 slot,
             )?
             .over_tensor(&out);
+        Ok(())
+    }
+
+    pub(crate) fn record_depth_store(
+        &self,
+        scheme: &mut Scheme,
+        src: TensorView<'_>,
+        tape: TensorView<'_>,
+        slot: u32,
+    ) -> Result<(), GoldyError> {
+        self.depth_store
+            .record(scheme, "depth_store", src, tape, slot)?
+            .over_tensor(&src);
+        Ok(())
+    }
+
+    pub(crate) fn record_depth_copy_rows(
+        &self,
+        scheme: &mut Scheme,
+        src: TensorView<'_>,
+        dst: TensorView<'_>,
+        src_slot: u32,
+        n: u32,
+    ) -> Result<(), GoldyError> {
+        let hidden = src.shape().dim(1)?;
+        self.depth_copy_rows
+            .record(scheme, "depth_copy", src, dst, src_slot, n)?
+            .over_1d(n.saturating_mul(hidden).max(1));
+        Ok(())
+    }
+
+    pub(crate) fn record_depth_mix(
+        &self,
+        scheme: &mut Scheme,
+        blocks: TensorView<'_>,
+        partial: TensorView<'_>,
+        queries: TensorView<'_>,
+        out: TensorView<'_>,
+        n_blocks: u32,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), GoldyError> {
+        let n_queries = queries.shape().dim(0)?;
+        if n_queries == 0 {
+            return Err(GoldyError::Validation(
+                "depth mix needs at least one query".into(),
+            ));
+        }
+        if n_blocks + 1 > crate::depth::DEPTH_MAX_KEYS {
+            return Err(GoldyError::Validation(
+                "depth mix has more keys than DEPTH_MAX_KEYS".into(),
+            ));
+        }
+        self.depth_mix
+            .record(
+                scheme,
+                "depth_mix",
+                blocks,
+                partial,
+                queries,
+                out,
+                n_blocks,
+                eps,
+                scale,
+            )?
+            .groups([n_queries, 1, 1]);
         Ok(())
     }
 

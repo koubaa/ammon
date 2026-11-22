@@ -11,6 +11,8 @@ mod decode_attn;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod decode_ops;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+mod depth;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod gpu;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub mod kernels;
@@ -22,9 +24,10 @@ mod moe;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
-    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DynamicShortConv,
-    Embedding, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm, ShortConv,
-    SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS,
+    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DepthPlan, DepthRunner,
+    DynamicShortConv, Embedding, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, RmsNorm,
+    ShortConv, SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights,
+    DEFAULT_RMS_EPS,
 };
 
 pub use generate::{
