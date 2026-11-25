@@ -159,6 +159,9 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
         k_conv_proj: k_proj.as_ref().map(Tensor::view),
         v_conv_proj: v_proj.as_ref().map(Tensor::view),
     };
+    // Specialization re-records while it warms up, so a short step list may
+    // never observe a clean submit. The replay check is about command buffers.
+    let _spec = goldy::test_support::SpecializationOverride::force_disabled();
     attn.record(
         &mut recorded,
         q_t.view(),

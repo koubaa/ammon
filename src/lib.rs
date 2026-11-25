@@ -5,6 +5,11 @@ pub mod generate;
 pub mod model;
 pub mod tokenizer;
 
+#[cfg(feature = "hf-tokenizer")]
+mod hf_tokenizer;
+#[cfg(feature = "hf-tokenizer")]
+pub use hf_tokenizer::HfTokenizer;
+
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 mod blocks;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
@@ -32,7 +37,8 @@ pub use modules::{
 };
 
 pub use generate::{
-    generate, generate_tokens, GenerateOptions, GenerateOutput, GenerateTokenOutput,
+    generate, generate_tokens, greedy_decode, GenerateOptions, GenerateOutput, GenerateTokenOutput,
+    GreedyReport,
 };
 pub use model::AutoregressiveModel;
 pub use tokenizer::{sample_argmax, BpeTokenizer, Tokenizer};
