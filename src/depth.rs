@@ -49,6 +49,10 @@ fn depth_copy_rows(
 ///
 /// `n_blocks` rows of `blocks` are valid. The partial is one more key. `n_blocks`
 /// may be 0 (messages whose previous-block slice is empty).
+///
+/// Every key is reduced at once: the workgroup splits into `lanes`-wide groups, one per
+/// key, and one tree folds each group's norm and query dot. The barrier count depends
+/// on `lanes`, not on the number of keys.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn depth_mix(
     #[tensor(shape = [capacity, hidden])] blocks: goldy::gpu::Tensor<f32>,
@@ -59,7 +63,8 @@ fn depth_mix(
     eps: f32,
     scale: f32,
 ) {
-    let mut scratch = goldy::gpu::workgroup_array::<f32, 256>();
+    let mut ss_part = goldy::gpu::workgroup_array::<f32, 256>();
+    let mut dot_part = goldy::gpu::workgroup_array::<f32, 256>();
     let mut scores = goldy::gpu::workgroup_array::<f32, 32>();
     let mut invs = goldy::gpu::workgroup_array::<f32, 32>();
     let mut probs = goldy::gpu::workgroup_array::<f32, 32>();
@@ -69,11 +74,16 @@ fn depth_mix(
     let n_keys = n_blocks + 1;
     let q_base = h * hidden;
 
-    let mut key = 0u32;
-    while key < n_keys {
-        let mut ss = 0.0;
-        let mut dot = 0.0;
-        let mut j = local;
+    let mut lanes = 256u32;
+    while lanes * n_keys > 256 {
+        lanes = lanes / 2;
+    }
+    let key = local / lanes;
+    let lane = local - key * lanes;
+    let mut ss = 0.0;
+    let mut dot = 0.0;
+    if key < n_keys {
+        let mut j = lane;
         while j < hidden {
             let mut v = partial[j];
             if key < n_blocks {
@@ -81,18 +91,27 @@ fn depth_mix(
             }
             ss = ss + v * v;
             dot = dot + queries[q_base + j] * v;
-            j = j + 256;
+            j = j + lanes;
         }
-        ss = goldy::gpu::workgroup_sum::<256>(ss, scratch);
-        dot = goldy::gpu::workgroup_sum::<256>(dot, scratch);
-        let inv = 1.0 / goldy::gpu::sqrt(ss / (hidden as f32) + eps);
-        if local == 0 {
-            scores[key] = dot * inv * scale;
-            invs[key] = inv;
+    }
+    ss_part[local] = ss;
+    dot_part[local] = dot;
+    goldy::gpu::workgroup_barrier();
+    let mut stride = lanes / 2;
+    while stride > 0 {
+        if lane < stride {
+            ss_part[local] = ss_part[local] + ss_part[local + stride];
+            dot_part[local] = dot_part[local] + dot_part[local + stride];
         }
         goldy::gpu::workgroup_barrier();
-        key = key + 1;
+        stride = stride / 2;
     }
+    if local < n_keys {
+        let inv = 1.0 / goldy::gpu::sqrt(ss_part[local * lanes] / (hidden as f32) + eps);
+        scores[local] = dot_part[local * lanes] * inv * scale;
+        invs[local] = inv;
+    }
+    goldy::gpu::workgroup_barrier();
 
     if local == 0 {
         let mut m = scores[0];
