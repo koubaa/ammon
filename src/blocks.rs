@@ -467,6 +467,47 @@ impl Blocks {
         self.tensors.matmul_into(scheme, label, weight, x, out)
     }
 
+    pub(crate) fn record_linear_bf16(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        weight: TensorView<'_>,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors
+            .recorder(scheme)
+            .matmul_bf16_into(label, weight, x, out)
+    }
+
+    pub(crate) fn record_nvfp4_indexed(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        codes: TensorView<'_>,
+        scales: TensorView<'_>,
+        factors: TensorView<'_>,
+        ids: TensorView<'_>,
+        slot: u32,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors.recorder(scheme).matmul_block_scaled_into(
+            label,
+            goldy::BlockScaled {
+                codes,
+                scales,
+                elems: goldy::ops::PackedElem::E2M1,
+                scale: goldy::ops::PackedScale::E4M3,
+                block: [1, 16],
+                global: Some(factors),
+            },
+            x,
+            Some((ids, slot)),
+            out,
+        )
+    }
+
     pub(crate) fn record_head_l2_clip(
         &self,
         scheme: &mut Scheme,

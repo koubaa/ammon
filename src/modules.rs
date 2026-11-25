@@ -223,6 +223,28 @@ impl Linear {
     ) -> Result<(), GoldyError> {
         self.blocks.record_linear(scheme, "linear", weight, x, out)
     }
+
+    /// `out = weight @ x` for a packed BF16 `[rows, k]` weight. The weight is
+    /// not expanded; the matvec promotes each element inside the dot.
+    pub fn record_bf16(
+        &self,
+        scheme: &mut Scheme,
+        weight: TensorView<'_>,
+        x: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.blocks
+            .record_linear_bf16(scheme, "linear_bf16", weight, x, out)
+    }
+}
+
+/// NVFP4 expert matrix: U8 codes `[experts, rows, k/2]`, F8_E4M3 scales
+/// `[experts, rows, k/16]`, and f32 per-expert factors `[experts]`.
+#[derive(Clone, Copy)]
+pub struct PackedExperts<'a> {
+    pub codes: TensorView<'a>,
+    pub scales: TensorView<'a>,
+    pub factors: TensorView<'a>,
 }
 
 /// Pre-norm causal attention block: RMSNorm, QKV, RoPE, attention, projection, residual.
@@ -1542,7 +1564,23 @@ impl DecodeMoe {
     pub fn top_k(&self) -> u32 {
         self.top_k
     }
+}
 
+/// Router matrix. BF16 stays packed and is promoted inside the dot.
+#[derive(Clone, Copy)]
+pub enum RouterWeight<'a> {
+    F32(TensorView<'a>),
+    Bf16(TensorView<'a>),
+}
+
+/// Expert stack. `Nvfp4` is E2M1 codes, E4M3 scales, block `[1, 16]`.
+#[derive(Clone, Copy)]
+pub enum ExpertWeight<'a> {
+    F32(TensorView<'a>),
+    Nvfp4(PackedExperts<'a>),
+}
+
+impl DecodeMoe {
     /// `router` is `[experts, hidden]`. `bias` is `[experts]`.
     /// `gate_up` is `[experts, 2 * intermediate, hidden]`.
     /// `down` is `[experts, hidden, intermediate]`.
@@ -1556,27 +1594,98 @@ impl DecodeMoe {
         down: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
+        self.record_experts(
+            scheme,
+            x,
+            bias,
+            RouterWeight::F32(router),
+            ExpertWeight::F32(gate_up),
+            ExpertWeight::F32(down),
+            out,
+        )
+    }
+
+    /// Same step as [`Self::record`] with a BF16 router and packed experts.
+    pub fn record_nvfp4(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        router: TensorView<'_>,
+        bias: TensorView<'_>,
+        gate_up: PackedExperts<'_>,
+        down: PackedExperts<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.record_experts(
+            scheme,
+            x,
+            bias,
+            RouterWeight::Bf16(router),
+            ExpertWeight::Nvfp4(gate_up),
+            ExpertWeight::Nvfp4(down),
+            out,
+        )
+    }
+
+    fn record_experts(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        bias: TensorView<'_>,
+        router: RouterWeight<'_>,
+        gate_up: ExpertWeight<'_>,
+        down: ExpertWeight<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
         if x.shape().dims() != [self.hidden] || out.shape().dims() != [self.hidden] {
             return Err(GoldyError::Validation("MoE x and out are [hidden]".into()));
         }
-        if router.shape().dims() != [self.n_experts, self.hidden]
+        let router_view = match router {
+            RouterWeight::F32(weight) | RouterWeight::Bf16(weight) => weight,
+        };
+        if router_view.shape().dims() != [self.n_experts, self.hidden]
             || bias.shape().dims() != [self.n_experts]
         {
             return Err(GoldyError::Validation(
                 "MoE router is [experts, hidden] and bias is [experts]".into(),
             ));
         }
-        let fused = 2 * self.intermediate;
-        if gate_up.shape().dims() != [self.n_experts, fused, self.hidden]
-            || down.shape().dims() != [self.n_experts, self.hidden, self.intermediate]
+        if matches!(gate_up, ExpertWeight::Nvfp4(_))
+            && (self.hidden % 16 != 0 || self.intermediate % 16 != 0)
         {
             return Err(GoldyError::Validation(
-                "MoE gate_up is [experts, 2 * intermediate, hidden] and down is [experts, hidden, intermediate]"
-                    .into(),
+                "NVFP4 MoE hidden and intermediate sizes must be multiples of 16".into(),
             ));
         }
+        if let ExpertWeight::F32(gate_up) = gate_up {
+            let fused = 2 * self.intermediate;
+            let down_view = match down {
+                ExpertWeight::F32(weight) => weight,
+                ExpertWeight::Nvfp4(_) => {
+                    return Err(GoldyError::Validation(
+                        "MoE gate_up and down must use the same packing".into(),
+                    ))
+                }
+            };
+            if gate_up.shape().dims() != [self.n_experts, fused, self.hidden]
+                || down_view.shape().dims() != [self.n_experts, self.hidden, self.intermediate]
+            {
+                return Err(GoldyError::Validation(
+                    "MoE gate_up is [experts, 2 * intermediate, hidden] and down is [experts, hidden, intermediate]"
+                        .into(),
+                ));
+            }
+        }
         self.blocks.record_zero(scheme, "moe_out", out)?;
-        self.linear.record(scheme, router, x, self.logits.view())?;
+        match router {
+            RouterWeight::F32(weight) => {
+                self.linear.record(scheme, weight, x, self.logits.view())?
+            }
+            RouterWeight::Bf16(weight) => {
+                self.linear
+                    .record_bf16(scheme, weight, x, self.logits.view())?
+            }
+        }
         self.blocks.record_moe_topk(
             scheme,
             self.logits.view(),
@@ -1592,15 +1701,28 @@ impl DecodeMoe {
                 TensorShape::vector(fused_len),
                 TensorDType::F32,
             )?;
-            self.blocks.record_indexed_matmul(
-                scheme,
-                "moe_gate_up",
-                gate_up,
-                x,
-                self.ids.view(),
-                slot,
-                fused.view(),
-            )?;
+            match gate_up {
+                ExpertWeight::F32(weight) => self.blocks.record_indexed_matmul(
+                    scheme,
+                    "moe_gate_up",
+                    weight,
+                    x,
+                    self.ids.view(),
+                    slot,
+                    fused.view(),
+                )?,
+                ExpertWeight::Nvfp4(weight) => self.blocks.record_nvfp4_indexed(
+                    scheme,
+                    "moe_gate_up",
+                    weight.codes,
+                    weight.scales,
+                    weight.factors,
+                    self.ids.view(),
+                    slot,
+                    x,
+                    fused.view(),
+                )?,
+            }
             let rows = fused.view().reshape(&[2, self.intermediate])?;
             let gate = rows.narrow(0, 0, 1)?.reshape(&[self.intermediate])?;
             let up = rows.narrow(0, 1, 1)?.reshape(&[self.intermediate])?;
@@ -1611,15 +1733,28 @@ impl DecodeMoe {
                 TensorShape::vector(self.hidden),
                 TensorDType::F32,
             )?;
-            self.blocks.record_indexed_matmul(
-                scheme,
-                "moe_down",
-                down,
-                self.activated.view(),
-                self.ids.view(),
-                slot,
-                projected.view(),
-            )?;
+            match down {
+                ExpertWeight::F32(weight) => self.blocks.record_indexed_matmul(
+                    scheme,
+                    "moe_down",
+                    weight,
+                    self.activated.view(),
+                    self.ids.view(),
+                    slot,
+                    projected.view(),
+                )?,
+                ExpertWeight::Nvfp4(weight) => self.blocks.record_nvfp4_indexed(
+                    scheme,
+                    "moe_down",
+                    weight.codes,
+                    weight.scales,
+                    weight.factors,
+                    self.ids.view(),
+                    slot,
+                    self.activated.view(),
+                    projected.view(),
+                )?,
+            }
             let weight = self.weights.view().narrow(0, slot, 1)?;
             let mut rec = self.blocks.tensor_recorder(scheme);
             let scaled = rec.mul("moe_scale", projected.view(), weight)?;

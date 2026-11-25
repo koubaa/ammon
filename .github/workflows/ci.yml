@@ -6,8 +6,8 @@
 #
 # Bump GOLDY_REF when ammon should build against a newer goldy. Change only
 # that value; the checkout step reads it. The pin is goldy main
-# (1e85889, merge of #339). Indexed GEMV reads the slab in place, and a
-# unit softcap is one tanh inside goldy.
+# (8a79d75, merge of #341, which includes #340). Indexed GEMV reads the
+# slab in place, and a unit softcap is one tanh inside goldy.
 
 name: CI
 
@@ -17,7 +17,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: 1e85889a948784a1931b265e7a0cfaa8b4ea73bf
+  GOLDY_REF: 8a79d75d9b8969ce941201284e805e3ca170c4de
 
 jobs:
   test:
