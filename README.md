@@ -28,7 +28,7 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 
 ## CI goldy pin
 
-`.github/workflows/ci.yml` sets `GOLDY_REF` to goldy `main` (`8a79d75d9b8969ce941201284e805e3ca170c4de`, the merge of [koubaa/goldy#341](https://github.com/koubaa/goldy/pull/341)). Ammon depends on Goldy by path (`../goldy`), so CI checks that commit out beside this repo. To move the pin, change only `GOLDY_REF` and push. `goldy::gpu::tanh` and `goldy::gpu::sigmoid` still use the odd Taylor series through `x^11` for `|x| < 0.5`.
+`.github/workflows/ci.yml` sets `GOLDY_REF` to goldy `main`. Ammon depends on Goldy by path (`../goldy`), so CI checks that branch out beside this repo. `goldy::gpu::tanh` and `goldy::gpu::sigmoid` still use the odd Taylor series through `x^11` for `|x| < 0.5`.
 
 ## Tests
 

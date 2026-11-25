@@ -4,11 +4,9 @@
 # as siblings. GPU tests are not optional: the job fails if lavapipe is missing
 # or does not advertise Vulkan 1.4.
 #
-# Bump GOLDY_REF when ammon should build against a newer goldy. Change only
-# that value; the checkout step reads it. The pin is goldy main
-# (8a79d75, merge of #341, which includes #340). Indexed GEMV reads the
-# slab in place, and a unit softcap is one tanh inside goldy. Retained
-# command buffers keep their own frame-table rows.
+# GOLDY_REF is the goldy checkout. It is the main branch, not a commit.
+# Indexed GEMV reads the slab in place, and a unit softcap is one tanh
+# inside goldy. Retained command buffers keep their own frame-table rows.
 
 name: CI
 
@@ -18,7 +16,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: 8a79d75d9b8969ce941201284e805e3ca170c4de
+  GOLDY_REF: main
 
 jobs:
   test:
