@@ -60,133 +60,193 @@ struct Spec {
     log: Option<LogPositionScale>,
 }
 
-fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
+type Step<'a> = (&'a [f32], &'a [f32], &'a [f32], &'a [f32]);
+
+/// One attention layer, its state, weights and activations.
+struct Layer {
+    attn: DecodeAttention,
+    state: DecodeLayerState,
+    wq: Tensor,
+    wk: Tensor,
+    wv: Tensor,
+    wo: Tensor,
+    wgate: Tensor,
+    wsink: Tensor,
+    wrel: Tensor,
+    rel_proj: Tensor,
+    q_scale: Tensor,
+    rel_scale: Tensor,
+    k_conv: Tensor,
+    v_conv: Tensor,
+    k_proj: Option<Tensor>,
+    v_proj: Option<Tensor>,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    step: goldy::Buffer,
+}
+
+impl Layer {
+    fn new(device: &Runtime, spec: &Spec, w: &Weights<'_>) -> Self {
+        let attn = DecodeAttention::new(
+            device,
+            spec.kind,
+            spec.q_heads,
+            spec.kv_heads,
+            spec.head,
+            spec.hidden,
+            spec.d_rel,
+            spec.rel_extent,
+            spec.kernel,
+            spec.dynamic,
+            1.25,
+            0.9,
+            1e-5,
+            spec.log,
+        )
+        .unwrap();
+        let state = match spec.kind {
+            DecodeAttentionKind::Sliding { window } => DecodeLayerState::sliding(
+                device,
+                window,
+                spec.capacity,
+                spec.kv_heads,
+                spec.head,
+                spec.q_heads,
+                spec.kernel,
+            ),
+            DecodeAttentionKind::Full => DecodeLayerState::full(
+                device,
+                spec.capacity,
+                spec.kv_heads,
+                spec.head,
+                spec.q_heads,
+                spec.kernel,
+            ),
+        }
+        .unwrap();
+        let q_dim = spec.q_heads * spec.head;
+        let kv_dim = spec.kv_heads * spec.head;
+        let (k_conv, v_conv, k_proj, v_proj) = if spec.dynamic {
+            (
+                matrix(device, spec.kernel, kv_dim, w.k_conv),
+                matrix(device, spec.kernel, kv_dim, w.v_conv),
+                Some(matrix(
+                    device,
+                    spec.kv_heads * spec.kernel,
+                    spec.hidden,
+                    w.k_conv_proj,
+                )),
+                Some(matrix(
+                    device,
+                    spec.kv_heads * spec.kernel,
+                    spec.hidden,
+                    w.v_conv_proj,
+                )),
+            )
+        } else {
+            (
+                matrix(device, kv_dim, spec.kernel, w.k_conv),
+                matrix(device, kv_dim, spec.kernel, w.v_conv),
+                None,
+                None,
+            )
+        };
+        let activation =
+            || Tensor::zeros(device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
+        Self {
+            attn,
+            state,
+            wq: matrix(device, q_dim, spec.hidden, w.wq),
+            wk: matrix(device, kv_dim, spec.hidden, w.wk),
+            wv: matrix(device, kv_dim, spec.hidden, w.wv),
+            wo: matrix(device, spec.hidden, q_dim, w.wo),
+            wgate: matrix(device, q_dim, spec.hidden, w.wgate),
+            wsink: matrix(device, spec.q_heads, spec.hidden, w.wsink),
+            wrel: matrix(device, spec.q_heads * spec.d_rel, spec.hidden, w.wrel),
+            rel_proj: matrix(device, spec.d_rel, spec.rel_extent, w.rel_proj),
+            q_scale: matrix(device, spec.q_heads, spec.head, w.q_scale),
+            rel_scale: matrix(device, spec.q_heads, spec.d_rel, w.rel_scale),
+            k_conv,
+            v_conv,
+            k_proj,
+            v_proj,
+            q: activation(),
+            k: activation(),
+            v: activation(),
+            out: activation(),
+            step: step_buf(device, 0),
+        }
+    }
+
+    fn record(&self, scheme: &mut Scheme) {
+        let weights = DecodeAttentionWeights {
+            wq: self.wq.view(),
+            wk: self.wk.view(),
+            wv: self.wv.view(),
+            wo: self.wo.view(),
+            wgate: self.wgate.view(),
+            wsink: self.wsink.view(),
+            wrel: self.wrel.view(),
+            rel_proj: self.rel_proj.view(),
+            q_scale: self.q_scale.view(),
+            rel_scale: self.rel_scale.view(),
+            k_conv: self.k_conv.view(),
+            v_conv: self.v_conv.view(),
+            k_conv_proj: self.k_proj.as_ref().map(Tensor::view),
+            v_conv_proj: self.v_proj.as_ref().map(Tensor::view),
+        };
+        self.attn
+            .record(
+                scheme,
+                self.q.view(),
+                self.k.view(),
+                self.v.view(),
+                weights,
+                &self.state,
+                &self.step,
+                self.out.view(),
+            )
+            .unwrap();
+    }
+
+    /// Writes step `i`'s activations and position.
+    fn load(&self, deposit: &goldy::DepositTransaction, i: usize, (q, k, v, _): Step<'_>) {
+        self.q.buffer().write(0, bytemuck::cast_slice(q)).unwrap();
+        self.k.buffer().write(0, bytemuck::cast_slice(k)).unwrap();
+        self.v.buffer().write(0, bytemuck::cast_slice(v)).unwrap();
+        self.state.deposit_position(deposit, 0, i as u32).unwrap();
+    }
+}
+
+/// Inference arithmetic against the reference, then the exact graph fused and unfused.
+fn run(spec: Spec, w: Weights<'_>, steps: &[Step<'_>]) {
+    matches_reference(&spec, &w, steps);
+    fused_matches_unfused(&spec, &w, steps);
+}
+
+fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>]) {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let attn = DecodeAttention::new(
-        &device,
-        spec.kind,
-        spec.q_heads,
-        spec.kv_heads,
-        spec.head,
-        spec.hidden,
-        spec.d_rel,
-        spec.rel_extent,
-        spec.kernel,
-        spec.dynamic,
-        1.25,
-        0.9,
-        1e-5,
-        spec.log,
-    )
-    .unwrap();
-    let state = match spec.kind {
-        DecodeAttentionKind::Sliding { window } => DecodeLayerState::sliding(
-            &device,
-            window,
-            spec.capacity,
-            spec.kv_heads,
-            spec.head,
-            spec.q_heads,
-            spec.kernel,
-        ),
-        DecodeAttentionKind::Full => DecodeLayerState::full(
-            &device,
-            spec.capacity,
-            spec.kv_heads,
-            spec.head,
-            spec.q_heads,
-            spec.kernel,
-        ),
-    }
-    .unwrap();
-    let q_dim = spec.q_heads * spec.head;
-    let kv_dim = spec.kv_heads * spec.head;
-    let wq = matrix(&device, q_dim, spec.hidden, w.wq);
-    let wk = matrix(&device, kv_dim, spec.hidden, w.wk);
-    let wv = matrix(&device, kv_dim, spec.hidden, w.wv);
-    let wo = matrix(&device, spec.hidden, q_dim, w.wo);
-    let wgate = matrix(&device, q_dim, spec.hidden, w.wgate);
-    let wsink = matrix(&device, spec.q_heads, spec.hidden, w.wsink);
-    let wrel = matrix(&device, spec.q_heads * spec.d_rel, spec.hidden, w.wrel);
-    let rel_proj = matrix(&device, spec.d_rel, spec.rel_extent, w.rel_proj);
-    let q_scale = matrix(&device, spec.q_heads, spec.head, w.q_scale);
-    let rel_scale = matrix(&device, spec.q_heads, spec.d_rel, w.rel_scale);
-    let (k_conv, v_conv, k_proj, v_proj) = if spec.dynamic {
-        (
-            matrix(&device, spec.kernel, kv_dim, w.k_conv),
-            matrix(&device, spec.kernel, kv_dim, w.v_conv),
-            Some(matrix(
-                &device,
-                spec.kv_heads * spec.kernel,
-                spec.hidden,
-                w.k_conv_proj,
-            )),
-            Some(matrix(
-                &device,
-                spec.kv_heads * spec.kernel,
-                spec.hidden,
-                w.v_conv_proj,
-            )),
-        )
-    } else {
-        (
-            matrix(&device, kv_dim, spec.kernel, w.k_conv),
-            matrix(&device, kv_dim, spec.kernel, w.v_conv),
-            None,
-            None,
-        )
-    };
-    let q_t = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
-    let k_t = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
-    let v_t = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
-    let out = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
-    let step = step_buf(&device, 0);
+    let layer = Layer::new(&device, spec, w);
     let mut recorded = Scheme::new(&ctx);
     configure_inference_scheme(&mut recorded);
-    let weights = DecodeAttentionWeights {
-        wq: wq.view(),
-        wk: wk.view(),
-        wv: wv.view(),
-        wo: wo.view(),
-        wgate: wgate.view(),
-        wsink: wsink.view(),
-        wrel: wrel.view(),
-        rel_proj: rel_proj.view(),
-        q_scale: q_scale.view(),
-        rel_scale: rel_scale.view(),
-        k_conv: k_conv.view(),
-        v_conv: v_conv.view(),
-        k_conv_proj: k_proj.as_ref().map(Tensor::view),
-        v_conv_proj: v_proj.as_ref().map(Tensor::view),
-    };
     // Specialization re-records while it warms up, so a short step list may
     // never observe a clean submit. The replay check is about command buffers.
     let _spec = goldy::test_support::SpecializationOverride::force_disabled();
-    attn.record(
-        &mut recorded,
-        q_t.view(),
-        k_t.view(),
-        v_t.view(),
-        weights,
-        &state,
-        &step,
-        out.view(),
-    )
-    .unwrap();
+    layer.record(&mut recorded);
     let mut upload = Scheme::new(&ctx);
     let deposit = MemoryExchange::new(&ctx)
-        .bind_deposit(&mut upload, DecodeStep::deposit_target(&step))
+        .bind_deposit(&mut upload, DecodeStep::deposit_target(&layer.step))
         .unwrap();
-    for (i, (q, k, v, y)) in steps.iter().enumerate() {
-        q_t.buffer().write(0, bytemuck::cast_slice(q)).unwrap();
-        k_t.buffer().write(0, bytemuck::cast_slice(k)).unwrap();
-        v_t.buffer().write(0, bytemuck::cast_slice(v)).unwrap();
-        state.deposit_position(&deposit, 0, i as u32).unwrap();
+    for (i, &step) in steps.iter().enumerate() {
+        layer.load(&deposit, i, step);
         let _ = upload.submit().unwrap();
         let _ = recorded.submit().unwrap();
         let mut read = Scheme::new(&ctx);
-        let got = read_f32(&mut read, out.buffer());
+        let got = read_f32(&mut read, layer.out.buffer());
+        let y = step.3;
         let err = max_abs(&got, y);
         assert!(err <= 1e-5, "step {i} max abs {err} got {got:?} want {y:?}");
     }
@@ -198,6 +258,78 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
     assert!(
         stats.clean_submits > 0,
         "no clean replay submits: {stats:?}"
+    );
+}
+
+/// Submits until the structure has replayed and no fused region is still compiling.
+fn settle_fusion(scheme: &mut Scheme) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let _ = scheme.submit().unwrap();
+        let report = scheme.fusion_report();
+        let open = report
+            .regions
+            .iter()
+            .any(|region| matches!(region.status, goldy::FusionRegionStatus::Compiling));
+        if scheme.replay_stats().clean_submits > 0 && !scheme.compiles_pending() && !open {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fusion did not settle: {report:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The layer recorded under `MatchRecorded` with automatic fusion on and off stores
+/// the same bytes at every step. A step's replay is idempotent, so the fused scheme
+/// settles on the first step's inputs.
+fn fused_matches_unfused(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>]) {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let _spec = goldy::test_support::SpecializationOverride::force_disabled();
+    let mut runs: Vec<(Layer, Scheme, Scheme, goldy::DepositTransaction)> = [true, false]
+        .into_iter()
+        .map(|fusion| {
+            let layer = Layer::new(&device, spec, w);
+            let mut scheme = Scheme::new(&ctx);
+            scheme.set_automatic_fusion(fusion);
+            layer.record(&mut scheme);
+            let mut upload = Scheme::new(&ctx);
+            let deposit = MemoryExchange::new(&ctx)
+                .bind_deposit(&mut upload, DecodeStep::deposit_target(&layer.step))
+                .unwrap();
+            (layer, scheme, upload, deposit)
+        })
+        .collect();
+    for (i, &step) in steps.iter().enumerate() {
+        let mut outputs = Vec::new();
+        for (layer, scheme, upload, deposit) in &mut runs {
+            layer.load(deposit, i, step);
+            let _ = upload.submit().unwrap();
+            if i == 0 && scheme.automatic_fusion() {
+                settle_fusion(scheme);
+            }
+            let _ = scheme.submit().unwrap();
+            let mut read = Scheme::new(&ctx);
+            let out: Vec<u32> = read_f32(&mut read, layer.out.buffer())
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            outputs.push(out);
+        }
+        assert_eq!(outputs[0], outputs[1], "step {i}: fused output differs");
+    }
+    let fused = &runs[0].1;
+    let report = fused.fusion_report();
+    assert!(
+        !report.regions.is_empty()
+            && report
+                .regions
+                .iter()
+                .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted)),
+        "{report:?}"
     );
 }
 

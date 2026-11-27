@@ -137,8 +137,8 @@ impl Embedding {
 ///
 /// `out = weight * x * rsqrt(mean(x²) + eps)` with [`DEFAULT_RMS_EPS`] unless
 /// [`Self::with_eps`] says otherwise. [`Self::record_unweighted`] omits the gain.
-/// These records dispatch the RMSNorm kernel. Pre-norm blocks can lower the same
-/// formula as tensor ops when `AMMON_SEMANTIC_NORM=1` and the scheme fuses automatically.
+/// It is recorded as tensor operations, which automatic fusion composes with the
+/// operations around them.
 pub struct RmsNorm {
     blocks: Arc<Blocks>,
     eps: f32,
@@ -965,7 +965,7 @@ impl DecodeKvCache {
 /// Persistent state for one attention visit: KV plus both K and V convolution
 /// states.
 ///
-/// `Inkling2Loop` needs one of these per layer and pass (48 for Mini). The
+/// A model that visits a layer more than once needs one of these per visit. The
 /// attention module keeps only scratch, so several visits can share it.
 /// Zeroing the KV rows is optional; zeroing the convolution state is what
 /// starts a sequence.
@@ -1762,9 +1762,9 @@ impl DecodeMoe {
             let mut rec = self.blocks.tensor_recorder(scheme);
             let scaled = rec.mul("moe_scale", projected.view(), weight)?;
             rec.add_into("moe_accum", out, scaled.view(), out)?;
-            self.blocks.keep_tensor(fused);
-            self.blocks.keep_tensor(projected);
-            self.blocks.keep_tensor(scaled);
+            for kept in [fused, projected, scaled] {
+                scheme.keep_alive(kept);
+            }
         }
         Ok(())
     }
@@ -1849,7 +1849,7 @@ impl DecodeMoe {
             rec.add_into("moe_accum", out, row(&scaled)?, out)?;
         }
         for kept in [gate, up, activated, projected, scaled] {
-            self.blocks.keep_tensor(kept);
+            scheme.keep_alive(kept);
         }
         Ok(())
     }

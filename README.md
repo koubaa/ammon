@@ -51,7 +51,7 @@ sudo apt-get install mesa-vulkan-drivers vulkan-tools
 # Pin the ICD when other Vulkan drivers are installed. DISPLAY may be unset.
 export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
 vulkaninfo --summary   # deviceName llvmpipe, apiVersion 1.4.*
-cargo test --features vulkan --lib --test kernels --test semantic_norm --test decode_ops
+cargo test --features vulkan --lib --test kernels --test fused_blocks --test decode_ops
 ```
 
-Kernel and block results are compared to an f64 CPU reference at atol 1e-5 and rtol 1e-4. `semantic_norm` turns on `AMMON_SEMANTIC_NORM=1` with automatic fusion so the tensor-op RMSNorm path is what runs inside the pre-norm blocks. `decode_ops` checks per-head L2 clip (optional scale and log-position scale), softcap, the sigmoid gate, softcapped SwiGLU, and static and dynamic short convolutions including reset. Softcap, the gate, and softcapped SwiGLU call `goldy::gpu::tanh` and `goldy::gpu::sigmoid`. The first run compiles shaders through Slang; later runs reuse Goldy's on-disk shader cache. Lavapipe is CPU-bound, so `-- --test-threads=1` is the reliable way to run the suite.
+Kernel and block results are compared to an f64 CPU reference at atol 1e-5 and rtol 1e-4. `fused_blocks` runs the pre-norm blocks under automatic fusion against the reference, and checks that the fused SwiGLU block stores the same bits as the unfused one under `MatchRecorded`. `decode_ops` checks per-head L2 clip (optional scale and log-position scale), softcap, the sigmoid gate, softcapped SwiGLU, and static and dynamic short convolutions including reset. Softcap, the gate, and softcapped SwiGLU call `goldy::gpu::tanh` and `goldy::gpu::sigmoid`. The first run compiles shaders through Slang; later runs reuse Goldy's on-disk shader cache. Lavapipe is CPU-bound, so `-- --test-threads=1` is the reliable way to run the suite.

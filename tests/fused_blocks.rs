@@ -1,11 +1,6 @@
-//! Pre-norm blocks with `AMMON_SEMANTIC_NORM=1` and automatic fusion.
-//!
-//! The tensor-op RMSNorm path is selected only when that variable is `1`. This
-//! binary sets it for every test so the kernel-test process, which expects the
-//! kernel path, never observes the variable.
-//!
-//! Run with `--test-threads=1`. `AMMON_SEMANTIC_NORM` is process-global, and a
-//! parallel `cargo test --features vulkan` can race the kernel-path tests.
+//! Pre-norm blocks under automatic fusion. With inference arithmetic they match the
+//! CPU reference; under `MatchRecorded` the fused graph stores what the unfused one
+//! does, bit for bit.
 
 #![cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 
@@ -19,19 +14,8 @@ use ammon::{
     SwiGluBlock, SwiGluBlockWeights,
 };
 use goldy::{BufferKind, Runtime, Scheme, Tensor, TensorShape};
-use std::sync::Once;
-
-fn enable_semantic_norm() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: set once before any GPU work in this process. Run with
-        // `--test-threads=1` so other threads are not reading the environment.
-        unsafe { std::env::set_var("AMMON_SEMANTIC_NORM", "1") }
-    });
-}
 
 fn runtime() -> Runtime {
-    enable_semantic_norm();
     create_runtime().expect("goldy runtime")
 }
 
@@ -134,7 +118,7 @@ fn fused_attention_block_norm_matches_cpu_reference() {
             eps,
         );
         cpu_ref::assert_close(
-            &format!("semantic attention pos {pos}"),
+            &format!("fused attention pos {pos}"),
             &read_f32(&mut scheme, x.buffer()),
             &x_host,
         );
@@ -191,8 +175,84 @@ fn fused_swiglu_block_matches_cpu_reference() {
         )
         .unwrap();
     cpu_ref::assert_close(
-        "semantic swiglu block",
+        "fused swiglu block",
         &read_f32(&mut scheme, x.buffer()),
         &cpu_ref::swiglu_block(&x_host, &norm_h, &w1_h, &w3_h, &w2_h, eps),
     );
+}
+
+/// Submits until the structure has replayed and no fused region is still compiling.
+fn settle_fusion(scheme: &mut Scheme) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let _ = scheme.submit().unwrap();
+        let report = scheme.fusion_report();
+        let open = report
+            .regions
+            .iter()
+            .any(|region| matches!(region.status, goldy::FusionRegionStatus::Compiling));
+        if scheme.replay_stats().clean_submits > 0 && !scheme.compiles_pending() && !open {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fusion did not settle: {report:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The SwiGLU block recorded with automatic fusion on and off under `MatchRecorded`:
+/// the gated product fuses with the projections and stores the same bytes.
+#[test]
+fn fused_swiglu_block_matches_unfused_bits() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let (hidden, intermediate) = (64u32, 96u32);
+    let block = SwiGluBlock::new(&device, hidden, intermediate).unwrap();
+    let tensor = |rows: u32, cols: u32, seed: u32| {
+        let data = cpu_ref::pseudo_random((rows * cols) as usize, seed);
+        Tensor::from_f32(&device, TensorShape::matrix(rows, cols), &data).unwrap()
+    };
+    let norm_h = cpu_ref::pseudo_random(hidden as usize, 101);
+    let norm = Tensor::from_f32(&device, TensorShape::vector(hidden), &norm_h).unwrap();
+    let w1 = tensor(intermediate, hidden, 102);
+    let w3 = tensor(intermediate, hidden, 103);
+    let w2 = tensor(hidden, intermediate, 104);
+    let x_host = cpu_ref::pseudo_random(hidden as usize, 105);
+    let run = |fusion: bool| {
+        let x = Tensor::from_f32(&device, TensorShape::vector(hidden), &x_host).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        scheme.set_automatic_fusion(fusion);
+        block
+            .record(
+                &mut scheme,
+                x.view(),
+                SwiGluBlockWeights {
+                    norm: norm.view(),
+                    gate: w1.view(),
+                    up: w3.view(),
+                    down: w2.view(),
+                },
+            )
+            .unwrap();
+        if fusion {
+            settle_fusion(&mut scheme);
+            let report = scheme.fusion_report();
+            assert!(
+                report.regions.iter().any(|region| {
+                    matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                        && region.labels.iter().any(|l| l.to_string() == "swiglu")
+                }),
+                "{report:?}"
+            );
+        }
+        // One step from the initial input: every earlier submit started from it too.
+        x.buffer().write(0, bytemuck::cast_slice(&x_host)).unwrap();
+        read_f32(&mut scheme, x.buffer())
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<u32>>()
+    };
+    assert_eq!(run(true), run(false));
 }

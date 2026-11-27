@@ -264,6 +264,87 @@ fn short_conv_at_replays_the_same_position_without_shifting() {
     );
 }
 
+/// Recorded with automatic fusion on and off under `MatchRecorded`, the convolution
+/// stores the same bytes at every position, past the wrap of its window.
+#[test]
+fn short_conv_at_fused_matches_unfused_bits() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let (channels, kernel) = (64u32, 4u32);
+    let weight = Tensor::from_f32(
+        &device,
+        TensorShape::matrix(channels, kernel),
+        &cpu_ref::pseudo_random((channels * kernel) as usize, 31),
+    )
+    .unwrap();
+    let runs: Vec<_> = [true, false]
+        .into_iter()
+        .map(|fusion| {
+            let conv = ShortConv::new(&device, channels, kernel).unwrap();
+            let x =
+                Tensor::zeros(&device, TensorShape::vector(channels), TensorDType::F32).unwrap();
+            let out =
+                Tensor::zeros(&device, TensorShape::vector(channels), TensorDType::F32).unwrap();
+            let step = step_buf(&device, 0);
+            let mut scheme = Scheme::new(&ctx);
+            scheme.set_automatic_fusion(fusion);
+            conv.record_at(&mut scheme, x.view(), weight.view(), &step, out.view())
+                .unwrap();
+            (conv, x, out, step, scheme)
+        })
+        .collect();
+    let mut runs = runs;
+    for position in 0..2 * kernel + 1 {
+        let input = cpu_ref::pseudo_random(channels as usize, 40 + position);
+        let mut outputs = Vec::new();
+        for (_, x, out, step, scheme) in &mut runs {
+            x.buffer().write(0, bytemuck::cast_slice(&input)).unwrap();
+            step.write(0, bytemuck::bytes_of(&DecodeStep { token: 0, position }))
+                .unwrap();
+            let fusing = scheme.automatic_fusion();
+            // Replaying a position stores the same row, so the fused scheme settles on
+            // the first one.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let _ = scheme.submit().unwrap();
+                let settled = !fusing
+                    || position > 0
+                    || (scheme.replay_stats().clean_submits > 0
+                        && !scheme.compiles_pending()
+                        && scheme.fusion_report().regions.iter().all(|region| {
+                            matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                        }));
+                if settled {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fusion did not settle"
+                );
+            }
+            let mut read = Scheme::new(&ctx);
+            outputs.push(
+                read_f32(&mut read, out.buffer())
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<u32>>(),
+            );
+        }
+        assert_eq!(outputs[0], outputs[1], "position {position}");
+    }
+    let report = runs[0].4.fusion_report();
+    assert!(
+        report.regions.iter().any(|region| {
+            matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                && region
+                    .labels
+                    .iter()
+                    .any(|l| l.to_string() == "short_conv_dot")
+        }),
+        "{report:?}"
+    );
+}
+
 #[test]
 fn short_conv_matches_cpu_reference_and_resets() {
     let device = runtime();
