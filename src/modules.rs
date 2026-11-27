@@ -577,6 +577,25 @@ impl SigmoidGate {
         }
         self.blocks.record_sigmoid_gate(scheme, values, logits)
     }
+
+    /// Record `out = values * sigmoid(logits)`.
+    pub fn record_into(
+        &self,
+        scheme: &mut Scheme,
+        values: TensorView<'_>,
+        logits: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if logits.shape().dims() != values.shape().dims()
+            || out.shape().dims() != values.shape().dims()
+        {
+            return Err(GoldyError::Validation(
+                "sigmoid gate: logits and out must match values".into(),
+            ));
+        }
+        self.blocks
+            .record_sigmoid_gate_into(scheme, values, logits, out)
+    }
 }
 
 /// `out = softcap(gate) * sigmoid(gate) * softcap(up)`.
@@ -1185,6 +1204,7 @@ pub struct DecodeAttention {
     sink: Tensor,
     attn: Tensor,
     gate_logits: Tensor,
+    gated_attn: Tensor,
 }
 
 impl DecodeAttention {
@@ -1278,6 +1298,7 @@ impl DecodeAttention {
             sink: vector(q_heads)?,
             attn: matrix(q_heads, head_dim)?,
             gate_logits: vector(q_dim)?,
+            gated_attn: vector(q_dim)?,
         })
     }
 
@@ -1431,9 +1452,14 @@ impl DecodeAttention {
         let attn_flat = self.attn.view().reshape(&[q_dim])?;
         self.linear
             .record(scheme, weights.wgate, q_hidden, self.gate_logits.view())?;
-        self.gate
-            .record(scheme, attn_flat, self.gate_logits.view())?;
-        self.linear.record(scheme, weights.wo, attn_flat, out)?;
+        self.gate.record_into(
+            scheme,
+            attn_flat,
+            self.gate_logits.view(),
+            self.gated_attn.view(),
+        )?;
+        self.linear
+            .record(scheme, weights.wo, self.gated_attn.view(), out)?;
         Ok(())
     }
 

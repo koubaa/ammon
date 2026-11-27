@@ -558,9 +558,19 @@ impl Blocks {
         values: TensorView<'_>,
         logits: TensorView<'_>,
     ) -> Result<(), GoldyError> {
+        self.record_sigmoid_gate_into(scheme, values, logits, values)
+    }
+
+    pub(crate) fn record_sigmoid_gate_into(
+        &self,
+        scheme: &mut Scheme,
+        values: TensorView<'_>,
+        logits: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
         let mut rec = self.tensors.recorder(scheme);
         let gate = rec.sigmoid("sigmoid_gate", logits)?;
-        rec.mul_into("sigmoid_gate_mul", values, gate.view(), values)?;
+        rec.mul_into("sigmoid_gate_mul", values, gate.view(), out)?;
         self.keep(gate);
         Ok(())
     }
