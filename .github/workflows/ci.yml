@@ -16,7 +16,8 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: main
+  # Stay on the gathered-GEMV branch until goldy #350 merges, then return this to main.
+  GOLDY_REF: cursor/indexed-batch-de61
 
 jobs:
   test:
