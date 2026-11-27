@@ -16,8 +16,8 @@ on:
     branches: [main]
 
 env:
-  # The gathered contraction and beta=1 product are on this branch until it merges, then main.
-  GOLDY_REF: cursor/gather-site-de61
+  # Goldy #351 is on main: the gathered contraction and beta = 1.
+  GOLDY_REF: main
 
 jobs:
   test:
