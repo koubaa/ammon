@@ -695,6 +695,24 @@ impl Blocks {
             .matmul_indexed_into(label, weight, x, ids, slot, out)
     }
 
+    /// `count` ids from `slot`. `out` is `[count * rows]`. `x_stride == 0` shares `x`.
+    pub(crate) fn record_indexed_matmul_batch(
+        &self,
+        scheme: &mut Scheme,
+        label: &str,
+        weight: TensorView<'_>,
+        x: TensorView<'_>,
+        ids: TensorView<'_>,
+        slot: u32,
+        count: u32,
+        x_stride: u32,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.tensors
+            .recorder(scheme)
+            .matmul_indexed_batch_into(label, weight, x, ids, slot, count, x_stride, out)
+    }
+
     fn vector(&self, len: u32) -> Result<Tensor, GoldyError> {
         Tensor::zeros(
             &self.runtime,
