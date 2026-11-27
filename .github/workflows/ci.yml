@@ -16,7 +16,8 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: main
+  # This branch calls matmul_indexed_batch_into, which is not on goldy main yet.
+  GOLDY_REF: cursor/indexed-batch-de61
 
 jobs:
   test:
