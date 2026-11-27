@@ -21,7 +21,8 @@ use crate::kernels::{
 use crate::moe::MoeTopkKernel;
 use anyhow::Context;
 use goldy::{
-    Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorScalar, TensorShape, TensorView,
+    ArithmeticPolicy, Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorLayout,
+    TensorScalar, TensorShape, TensorView,
 };
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -627,6 +628,40 @@ impl Blocks {
             )?
             .over_tensor(&x);
         Ok(())
+    }
+
+    pub(crate) fn record_fusable_short_conv_at(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: TensorView<'_>,
+        state: TensorView<'_>,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if scheme.automatic_fusion() && scheme.arithmetic_policy() == ArithmeticPolicy::Relaxed {
+            let channels = x.shape().dim(0)?;
+            let kernel = state.shape().dim(1)?;
+            let position = TensorView::new(
+                step,
+                TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
+            )?;
+            let dot = self.vector(channels)?;
+            let summed = self.vector(channels)?;
+            let mut rec = self.tensors.recorder(scheme);
+            rec.cyclic_dot_at("short_conv", x, weight, state, position, dot.view())?;
+            rec.add_into("short_conv_skip", dot.view(), x, summed.view())?;
+            rec.div_scalar_into(
+                "short_conv_scale",
+                summed.view(),
+                ((kernel as f32) + 1.0).sqrt(),
+                out,
+            )?;
+            self.keep(dot);
+            self.keep(summed);
+            return Ok(());
+        }
+        self.record_short_conv_at(scheme, x, weight, state, step, out)
     }
 
     pub(crate) fn record_short_conv_at(
