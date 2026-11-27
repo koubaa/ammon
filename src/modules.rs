@@ -598,10 +598,6 @@ impl SoftcappedSwiGlu {
         })
     }
 
-    pub fn caps(&self) -> (f32, f32) {
-        (self.gate_cap, self.up_cap)
-    }
-
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -1773,8 +1769,14 @@ impl DecodeMoe {
         Ok(())
     }
 
-    /// One gate-up, one gated product over the stacked `[k, 2, I]` buffer, one down,
-    /// and `out += projectedᵀ · weights`.
+    /// Gathered gate and up products over the two halves of each expert's stacked
+    /// gate-up rows, and the gated product over `[k, I]`; then per slot a down
+    /// projection, its scale, and the add onto `out`.
+    ///
+    /// Separate halves let one fused kernel compute every gate and up row once. Each
+    /// slot's down reads one slab index, so the downs and the running sum stay one
+    /// fused kernel; a batched down would leave the sum over slots to read
+    /// projections another thread computes.
     fn record_f32_experts(
         &self,
         scheme: &mut Scheme,
@@ -1784,66 +1786,71 @@ impl DecodeMoe {
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         let k = self.top_k;
-        let fused_len = 2 * self.intermediate;
-        let fused = Tensor::zeros(
-            self.blocks.runtime(),
-            TensorShape::vector(k * fused_len),
-            TensorDType::F32,
-        )?;
-        self.blocks.record_indexed_matmul_batch(
+        let inter = self.intermediate;
+        let scratch = || {
+            Tensor::zeros(
+                self.blocks.runtime(),
+                TensorShape::vector(k * inter),
+                TensorDType::F32,
+            )
+        };
+        let (gate, up, activated) = (scratch()?, scratch()?, scratch()?);
+        for (label, half, product) in [("moe_gate", 0, &gate), ("moe_up", 1, &up)] {
+            self.blocks.record_indexed_matmul_batch(
+                scheme,
+                label,
+                gate_w.narrow(1, half * inter, inter)?,
+                x,
+                self.ids.view(),
+                0,
+                k,
+                0,
+                product.view(),
+            )?;
+        }
+        fn by_slot(t: &Tensor, k: u32, inter: u32) -> Result<TensorView<'_>, GoldyError> {
+            t.view().reshape(&[k, inter])
+        }
+        self.swiglu.record(
             scheme,
-            "moe_gate_up",
-            gate_w,
-            x,
-            self.ids.view(),
-            0,
-            k,
-            0,
-            fused.view(),
+            by_slot(&gate, k, inter)?,
+            by_slot(&up, k, inter)?,
+            by_slot(&activated, k, inter)?,
         )?;
-        let activated = Tensor::zeros(
-            self.blocks.runtime(),
-            TensorShape::vector(k * self.intermediate),
-            TensorDType::F32,
-        )?;
-        let layout = fused.view().reshape(&[k, 2, self.intermediate])?;
-        let gate = layout.narrow(1, 0, 1)?;
-        let up = layout.narrow(1, 1, 1)?;
-        let act = activated.view().reshape(&[k, 1, self.intermediate])?;
-        let (gate_cap, up_cap) = self.swiglu.caps();
-        self.blocks
-            .record_gated_product(scheme, gate, up, act, gate_cap, up_cap)?;
         let projected = Tensor::zeros(
             self.blocks.runtime(),
             TensorShape::vector(k * self.hidden),
             TensorDType::F32,
         )?;
-        self.blocks.record_indexed_matmul_batch(
-            scheme,
-            "moe_down",
-            down_w,
-            activated.view(),
-            self.ids.view(),
-            0,
-            k,
-            self.intermediate,
-            projected.view(),
+        let scaled = Tensor::zeros(
+            self.blocks.runtime(),
+            TensorShape::vector(k * self.hidden),
+            TensorDType::F32,
         )?;
-        // `out += projectedᵀ · weights`. `projected` is `[k, hidden]` row-major, so
-        // transposing the left factor reads `projected[s, h]`. beta = 1 adds onto `out`.
-        let mut desc = goldy::MatMulDesc::gemm(self.hidden, 1, k);
-        desc.transpose_a = true;
-        desc.beta = 1.0;
-        let out_off = out.storage_offset();
-        scheme
-            .matmul("moe_mix", desc)
-            .a(projected.buffer(), goldy::MatMulView::packed())
-            .b(self.weights.buffer(), goldy::MatMulView::packed())
-            .out(out.buffer(), goldy::MatMulView::offset(out_off))
-            .record();
-        self.blocks.keep_tensor(fused);
-        self.blocks.keep_tensor(activated);
-        self.blocks.keep_tensor(projected);
+        for slot in 0..k {
+            fn rows(t: &Tensor, slot: u32, len: u32) -> Result<TensorView<'_>, GoldyError> {
+                t.view().narrow(0, slot * len, len)
+            }
+            let row = |t| rows(t, slot, self.hidden);
+            self.blocks.record_indexed_matmul(
+                scheme,
+                "moe_down",
+                down_w,
+                activated
+                    .view()
+                    .narrow(0, slot * self.intermediate, self.intermediate)?,
+                self.ids.view(),
+                slot,
+                row(&projected)?,
+            )?;
+            let weight = self.weights.view().narrow(0, slot, 1)?;
+            let mut rec = self.blocks.tensor_recorder(scheme);
+            rec.mul_into("moe_scale", row(&projected)?, weight, row(&scaled)?)?;
+            rec.add_into("moe_accum", out, row(&scaled)?, out)?;
+        }
+        for kept in [gate, up, activated, projected, scaled] {
+            self.blocks.keep_tensor(kept);
+        }
         Ok(())
     }
 }
