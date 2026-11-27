@@ -16,7 +16,7 @@ on:
     branches: [main]
 
 env:
-  # This branch calls matmul_indexed_batch_into, which is not on goldy main yet.
+  # Stay on the gathered-GEMV branch until goldy #350 merges, then return this to main.
   GOLDY_REF: cursor/indexed-batch-de61
 
 jobs:
