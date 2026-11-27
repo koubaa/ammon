@@ -16,7 +16,9 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: main
+  # Dependency PR: https://github.com/koubaa/goldy/pull/353
+  # Repin to main after that PR merges.
+  GOLDY_REF: cursor/cyclic-window-fusion-d421
 
 jobs:
   test:
