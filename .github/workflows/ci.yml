@@ -16,9 +16,9 @@ on:
     branches: [main]
 
 env:
-  # Dependency PR: https://github.com/koubaa/goldy/pull/355
-  # Repin to main after that PR merges.
-  GOLDY_REF: cursor/described-dispatches-06c6
+  # Dependency PR: https://github.com/koubaa/goldy/pull/356 (stacked on #355)
+  # Repin to main after those PRs merge.
+  GOLDY_REF: cursor/cyclic-store-scalar-bounds-06c6
 
 jobs:
   test:
