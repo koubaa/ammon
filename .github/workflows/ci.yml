@@ -16,8 +16,8 @@ on:
     branches: [main]
 
 env:
-  # Stay on the gathered-GEMV branch until goldy #350 merges, then return this to main.
-  GOLDY_REF: cursor/indexed-batch-de61
+  # The gathered contraction and beta=1 product are on this branch until it merges, then main.
+  GOLDY_REF: cursor/gather-site-de61
 
 jobs:
   test:

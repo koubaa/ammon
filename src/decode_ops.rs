@@ -101,11 +101,13 @@ fn sigmoid_gate(
 /// `out = softcap(gate) * sigmoid(gate) * softcap(up)`.
 ///
 /// Sigmoid sees the raw gate. Both caps use [`goldy::gpu::tanh`].
+/// Rank 3 so a strided slice of a `[slots, 2, cols]` buffer is one dispatch.
+/// Linear `i` is `(slot, 0, col)` under the view's strides.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn softcapped_swiglu(
-    #[tensor(shape = [n])] gate: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [n])] up: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [n])] out: goldy::gpu::TensorWrite<f32>,
+    #[tensor(shape = [a, b, c])] gate: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [a, b, c])] up: goldy::gpu::Tensor<f32>,
+    #[tensor(shape = [a, b, c])] out: goldy::gpu::TensorWrite<f32>,
     gate_cap: f32,
     up_cap: f32,
 ) {

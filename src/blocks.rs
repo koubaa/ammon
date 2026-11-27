@@ -590,6 +590,33 @@ impl Blocks {
         Ok(())
     }
 
+    /// One dispatch of the gated product over rank-3 views that share a shape.
+    /// `gate`, `up`, and `out` are `[slots, 1, cols]` slices, so a strided half of
+    /// a `[slots, 2, cols]` buffer needs no per-slot launch.
+    pub(crate) fn record_gated_product(
+        &self,
+        scheme: &mut Scheme,
+        gate: TensorView<'_>,
+        up: TensorView<'_>,
+        out: TensorView<'_>,
+        gate_cap: f32,
+        up_cap: f32,
+    ) -> Result<(), GoldyError> {
+        if gate.shape().rank() != 3
+            || up.shape().dims() != gate.shape().dims()
+            || out.shape().dims() != gate.shape().dims()
+        {
+            return Err(GoldyError::Validation(
+                "gated product: gate, up, and out are rank 3 and match".into(),
+            ));
+        }
+        let n = gate.numel_u32().max(1);
+        self.softcapped_swiglu
+            .record(scheme, "gated_product", gate, up, out, gate_cap, up_cap)?
+            .over_1d(n);
+        Ok(())
+    }
+
     pub(crate) fn record_short_conv(
         &self,
         scheme: &mut Scheme,

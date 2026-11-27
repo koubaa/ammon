@@ -598,6 +598,10 @@ impl SoftcappedSwiGlu {
         })
     }
 
+    pub fn caps(&self) -> (f32, f32) {
+        (self.gate_cap, self.up_cap)
+    }
+
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -1769,8 +1773,8 @@ impl DecodeMoe {
         Ok(())
     }
 
-    /// One gate-up over every selected id, one down over the stacked activations,
-    /// then the scales and the accumulator as adjacent tensor ops so they fuse.
+    /// One gate-up, one gated product over the stacked `[k, 2, I]` buffer, one down,
+    /// and `out += projectedᵀ · weights`.
     fn record_f32_experts(
         &self,
         scheme: &mut Scheme,
@@ -1802,18 +1806,13 @@ impl DecodeMoe {
             TensorShape::vector(k * self.intermediate),
             TensorDType::F32,
         )?;
-        for slot in 0..k {
-            let rows = fused
-                .view()
-                .narrow(0, slot * fused_len, fused_len)?
-                .reshape(&[2, self.intermediate])?;
-            let gate = rows.narrow(0, 0, 1)?.reshape(&[self.intermediate])?;
-            let up = rows.narrow(0, 1, 1)?.reshape(&[self.intermediate])?;
-            let act = activated
-                .view()
-                .narrow(0, slot * self.intermediate, self.intermediate)?;
-            self.swiglu.record(scheme, gate, up, act)?;
-        }
+        let layout = fused.view().reshape(&[k, 2, self.intermediate])?;
+        let gate = layout.narrow(1, 0, 1)?;
+        let up = layout.narrow(1, 1, 1)?;
+        let act = activated.view().reshape(&[k, 1, self.intermediate])?;
+        let (gate_cap, up_cap) = self.swiglu.caps();
+        self.blocks
+            .record_gated_product(scheme, gate, up, act, gate_cap, up_cap)?;
         let projected = Tensor::zeros(
             self.blocks.runtime(),
             TensorShape::vector(k * self.hidden),
@@ -1830,21 +1829,18 @@ impl DecodeMoe {
             self.intermediate,
             projected.view(),
         )?;
-        let mut rec = self.blocks.tensor_recorder(scheme);
-        let mut kept = Vec::new();
-        for slot in 0..k {
-            let row = projected
-                .view()
-                .narrow(0, slot * self.hidden, self.hidden)?;
-            let weight = self.weights.view().narrow(0, slot, 1)?;
-            let scaled = rec.mul("moe_scale", row, weight)?;
-            rec.add_into("moe_accum", out, scaled.view(), out)?;
-            kept.push(scaled);
-        }
-        drop(rec);
-        for scaled in kept {
-            self.blocks.keep_tensor(scaled);
-        }
+        // `out += projectedᵀ · weights`. `projected` is `[k, hidden]` row-major, so
+        // transposing the left factor reads `projected[s, h]`. beta = 1 adds onto `out`.
+        let mut desc = goldy::MatMulDesc::gemm(self.hidden, 1, k);
+        desc.transpose_a = true;
+        desc.beta = 1.0;
+        let out_off = out.storage_offset();
+        scheme
+            .matmul("moe_mix", desc)
+            .a(projected.buffer(), goldy::MatMulView::packed())
+            .b(self.weights.buffer(), goldy::MatMulView::packed())
+            .out(out.buffer(), goldy::MatMulView::offset(out_off))
+            .record();
         self.blocks.keep_tensor(fused);
         self.blocks.keep_tensor(activated);
         self.blocks.keep_tensor(projected);
