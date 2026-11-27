@@ -24,6 +24,11 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 
 ## API notes
 
+Ammon inference accepts normal floating-point noise. Configure each retained worker
+scheme with `ammon::configure_inference_scheme(&mut scheme)` to select Goldy's relaxed
+generated-kernel and fusion variants. Validation or reproducibility checks can leave the
+default `ArithmeticPolicy::MatchRecorded` in place.
+
 `RmsnormKernel::record` and `RmsnormInplaceKernel::record` take a trailing `eps: f32`. That is a source break for anyone calling those kernels directly. `RmsNorm::new`, `RmsNorm::record`, `RmsNorm::record_inplace`, and the pre-norm block `new` constructors are unchanged and still use `DEFAULT_RMS_EPS` (`1e-5`). Pass another epsilon with `with_eps`.
 
 ## CI goldy pin

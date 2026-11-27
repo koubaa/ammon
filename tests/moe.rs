@@ -11,7 +11,7 @@
 mod goldens;
 
 use ammon::gpu::create_runtime;
-use ammon::DecodeMoe;
+use ammon::{configure_inference_scheme, DecodeMoe};
 use goldy::{Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
 fn runtime() -> Runtime {
@@ -79,6 +79,7 @@ fn replay(spec: Spec) {
     let x = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
     let out = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
     let mut recorded = Scheme::new(&ctx);
+    configure_inference_scheme(&mut recorded);
     moe.record(
         &mut recorded,
         x.view(),

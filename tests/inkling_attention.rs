@@ -12,8 +12,8 @@ mod goldens;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights, DecodeLayerState,
-    LogPositionScale,
+    configure_inference_scheme, DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights,
+    DecodeLayerState, LogPositionScale,
 };
 use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
@@ -143,6 +143,7 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[(&[f32], &[f32], &[f32], &[f32])]) {
     let out = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
     let step = step_buf(&device, 0);
     let mut recorded = Scheme::new(&ctx);
+    configure_inference_scheme(&mut recorded);
     let weights = DecodeAttentionWeights {
         wq: wq.view(),
         wk: wk.view(),
@@ -543,6 +544,7 @@ fn full_cache_replay_past_capacity_does_not_write() {
         v_conv_proj: None,
     };
     let mut recorded = Scheme::new(&ctx);
+    configure_inference_scheme(&mut recorded);
     attn.record(
         &mut recorded,
         hidden.view(),
