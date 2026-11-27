@@ -15,7 +15,8 @@ mod cpu_ref;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    CausalAttentionBlock, CausalAttentionBlockWeights, KvCache, SwiGluBlock, SwiGluBlockWeights,
+    configure_inference_scheme, CausalAttentionBlock, CausalAttentionBlockWeights, KvCache,
+    SwiGluBlock, SwiGluBlockWeights,
 };
 use goldy::{BufferKind, Runtime, Scheme, Tensor, TensorShape};
 use std::sync::Once;
@@ -106,6 +107,7 @@ fn fused_attention_block_norm_matches_cpu_reference() {
     for pos in [0u32, 9] {
         let step = step_buf(&device, 1, pos);
         let mut scheme = Scheme::new(&ctx);
+        configure_inference_scheme(&mut scheme);
         scheme.set_automatic_fusion(true);
         block
             .record(
@@ -174,6 +176,7 @@ fn fused_swiglu_block_matches_cpu_reference() {
     )
     .unwrap();
     let mut scheme = Scheme::new(&ctx);
+    configure_inference_scheme(&mut scheme);
     scheme.set_automatic_fusion(true);
     block
         .record(

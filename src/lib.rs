@@ -1,5 +1,14 @@
 //! Inference operators and decode control on Goldy. Not a training runtime.
 
+/// Configure a Goldy scheme for inference arithmetic.
+///
+/// This permits ordinary floating-point transformations in generated kernels and
+/// their fused replacements. Call it before or after recording; exact validation
+/// schemes can keep Goldy's default [`goldy::ArithmeticPolicy::MatchRecorded`].
+pub fn configure_inference_scheme(scheme: &mut goldy::Scheme) {
+    scheme.set_arithmetic_policy(goldy::ArithmeticPolicy::Relaxed);
+}
+
 pub mod checkpoint;
 pub mod generate;
 pub mod model;

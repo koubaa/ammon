@@ -574,9 +574,11 @@ impl Blocks {
         gate_cap: f32,
         up_cap: f32,
     ) -> Result<(), GoldyError> {
-        let g = self.vector(gate.numel_u32())?;
-        let u = self.vector(up.numel_u32())?;
-        let s = self.vector(gate.numel_u32())?;
+        // Scratch takes the gate's shape, so a `[slots, cols]` gate stays one op each.
+        let scratch = || Tensor::zeros(&self.runtime, gate.shape(), TensorDType::F32);
+        let g = scratch()?;
+        let u = scratch()?;
+        let s = scratch()?;
         self.record_softcap(scheme, gate, g.view(), gate_cap)?;
         self.record_softcap(scheme, up, u.view(), up_cap)?;
         let mut rec = self.tensors.recorder(scheme);

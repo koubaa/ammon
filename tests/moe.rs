@@ -11,7 +11,7 @@
 mod goldens;
 
 use ammon::gpu::create_runtime;
-use ammon::DecodeMoe;
+use ammon::{configure_inference_scheme, DecodeMoe};
 use goldy::{Runtime, Scheme, Tensor, TensorDType, TensorShape};
 
 fn runtime() -> Runtime {
@@ -79,6 +79,7 @@ fn replay(spec: Spec) {
     let x = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
     let out = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
     let mut recorded = Scheme::new(&ctx);
+    configure_inference_scheme(&mut recorded);
     moe.record(
         &mut recorded,
         x.view(),
@@ -115,6 +116,160 @@ fn replay(spec: Spec) {
     let stats = recorded.replay_stats();
     assert_eq!(stats.topology_records, 0, "{stats:?}");
     assert!(stats.clean_submits > 0, "{stats:?}");
+}
+
+fn settle_fusion(scheme: &mut Scheme) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let _ = scheme.submit().unwrap();
+        let report = scheme.fusion_report();
+        let open = report
+            .regions
+            .iter()
+            .any(|region| matches!(region.status, goldy::FusionRegionStatus::Compiling));
+        if scheme.replay_stats().clean_submits > 0 && !scheme.compiles_pending() && !open {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fusion did not settle: {report:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The same step recorded twice, with automatic fusion off and on. Once fusion and
+/// specialization have settled, every token's output is the same bytes, and the
+/// experts run as two fused regions: gate-up with the gated product, and down with
+/// the weighted sum.
+fn fused_matches_unfused(spec: Spec) {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let router = tensor3(&device, &[spec.n_experts, spec.hidden], spec.router);
+    let bias = Tensor::from_f32(&device, TensorShape::vector(spec.n_experts), spec.bias).unwrap();
+    let gate_up = tensor3(
+        &device,
+        &[spec.n_experts, 2 * spec.intermediate, spec.hidden],
+        spec.gate_up,
+    );
+    let down = tensor3(
+        &device,
+        &[spec.n_experts, spec.hidden, spec.intermediate],
+        spec.down,
+    );
+    let x = Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
+    let record = |fusion: bool| {
+        let moe = DecodeMoe::new(
+            &device,
+            spec.n_experts,
+            spec.top_k,
+            spec.hidden,
+            spec.intermediate,
+            1.5,
+            4.0,
+            25.0,
+        )
+        .unwrap();
+        let out =
+            Tensor::zeros(&device, TensorShape::vector(spec.hidden), TensorDType::F32).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        scheme.set_automatic_fusion(fusion);
+        moe.record(
+            &mut scheme,
+            x.view(),
+            router.view(),
+            bias.view(),
+            gate_up.view(),
+            down.view(),
+            out.view(),
+        )
+        .unwrap();
+        (moe, out, scheme)
+    };
+    let (_plain_moe, plain_out, mut plain) = record(false);
+    let (_fused_moe, fused_out, mut fused) = record(true);
+    let h = spec.hidden as usize;
+    x.buffer()
+        .write(0, bytemuck::cast_slice(&spec.x[..h]))
+        .unwrap();
+    // Both schemes share the weights, so each one's first submit registers topology the
+    // other sees.
+    let _ = plain.submit().unwrap();
+    settle_fusion(&mut fused);
+    settle_fusion(&mut plain);
+    for scheme in [&fused, &plain] {
+        let stats = scheme.replay_stats();
+        assert!(stats.specialization_promotions > 0, "{stats:?}");
+    }
+    let records = fused.replay_stats().topology_records;
+    let report = fused.fusion_report();
+    let region_of = |label: &str| {
+        report
+            .regions
+            .iter()
+            .position(|region| region.labels.iter().any(|l| l.to_string() == label))
+            .unwrap_or_else(|| panic!("`{label}` is not fused: {report:?}"))
+    };
+    assert_eq!(region_of("moe_gate"), region_of("swiglu"), "{report:?}");
+    assert_eq!(region_of("moe_up"), region_of("swiglu"), "{report:?}");
+    assert_eq!(region_of("moe_down"), region_of("moe_accum"), "{report:?}");
+    assert!(
+        report
+            .regions
+            .iter()
+            .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted)),
+        "{report:?}"
+    );
+    for t in 0..spec.tokens {
+        let token = &spec.x[t * h..(t + 1) * h];
+        let want = &spec.y[t * h..(t + 1) * h];
+        x.buffer().write(0, bytemuck::cast_slice(token)).unwrap();
+        let _ = plain.submit().unwrap();
+        let mut read = Scheme::new(&ctx);
+        let unfused = read_f32(&mut read, plain_out.buffer());
+        let _ = fused.submit().unwrap();
+        let mut read = Scheme::new(&ctx);
+        let got = read_f32(&mut read, fused_out.buffer());
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got), bits(&unfused), "token {t}");
+        let err = max_abs(&got, want);
+        assert!(err <= 1e-5, "token {t} max abs {err}");
+    }
+    assert_eq!(fused.replay_stats().topology_records, records);
+}
+
+#[test]
+fn fused_near_tie_tokens_match_unfused_bytes() {
+    fused_matches_unfused(Spec {
+        n_experts: 16,
+        top_k: 4,
+        hidden: 32,
+        intermediate: 16,
+        tokens: 4,
+        router: &goldens::NEAR_ROUTER,
+        bias: &goldens::NEAR_BIAS,
+        gate_up: &goldens::NEAR_GATE_UP,
+        down: &goldens::NEAR_DOWN,
+        x: &goldens::NEAR_X,
+        y: &goldens::NEAR_Y,
+    });
+}
+
+#[test]
+fn fused_wide_router_matches_unfused_bytes() {
+    fused_matches_unfused(Spec {
+        n_experts: 128,
+        top_k: 8,
+        hidden: 24,
+        intermediate: 8,
+        tokens: 2,
+        router: &goldens::WIDE_ROUTER,
+        bias: &goldens::WIDE_BIAS,
+        gate_up: &goldens::WIDE_GATE_UP,
+        down: &goldens::WIDE_DOWN,
+        x: &goldens::WIDE_X,
+        y: &goldens::WIDE_Y,
+    });
 }
 
 #[test]

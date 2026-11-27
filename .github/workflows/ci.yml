@@ -4,7 +4,7 @@
 # as siblings. GPU tests are not optional: the job fails if lavapipe is missing
 # or does not advertise Vulkan 1.4.
 #
-# GOLDY_REF is the goldy checkout. It is the main branch, not a commit.
+# GOLDY_REF is the goldy checkout: a branch, not a commit.
 # Indexed GEMV reads the slab in place, and a unit softcap is one tanh
 # inside goldy. Retained command buffers keep their own frame-table rows.
 
@@ -16,8 +16,9 @@ on:
     branches: [main]
 
 env:
-  # Stay on the gathered-GEMV branch until goldy #350 merges, then return this to main.
-  GOLDY_REF: cursor/indexed-batch-de61
+  # Until it merges: gathered reads stay at their own batch position, and a
+  # specialized fused region rounds every result as its dispatches did.
+  GOLDY_REF: cursor/fused-reads-exact-d421
 
 jobs:
   test:
