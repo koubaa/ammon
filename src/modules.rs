@@ -1123,11 +1123,33 @@ impl DynamicShortConv {
         let flat = self.taps.view().reshape(&[tap_len])?;
         self.blocks
             .record_linear(scheme, "conv_taps", proj, dynamic_input, flat)?;
+        self.record_projected(scheme, x, static_weight, self.taps.view(), out)
+    }
+
+    /// Record the convolution from already projected `[heads, kernel]` taps.
+    pub fn record_projected(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        static_weight: TensorView<'_>,
+        taps: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        if x.shape().dims() != [self.channels]
+            || out.shape().dims() != [self.channels]
+            || static_weight.shape().dims() != [self.kernel_size, self.channels]
+            || taps.shape().dims() != [self.num_heads, self.kernel_size]
+        {
+            return Err(GoldyError::Validation(
+                "dynamic short conv: x [channels], static_weight [kernel, channels], taps [heads, kernel]"
+                    .into(),
+            ));
+        }
         self.blocks.record_dynamic_short_conv(
             scheme,
             x,
             static_weight,
-            self.taps.view(),
+            taps,
             self.state.view(),
             out,
         )
