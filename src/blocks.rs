@@ -655,53 +655,17 @@ impl Blocks {
         state: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        if [x, static_weight, taps, state, out]
-            .iter()
-            .any(|view| view.dtype() != TensorDType::F32 || !view.is_contiguous())
-        {
-            return Err(GoldyError::Validation(
-                "dynamic short conv tensors must be contiguous f32".into(),
-            ));
-        }
-        let x_offset = u32::try_from(x.storage_offset()).map_err(|_| {
-            GoldyError::Validation("dynamic short conv input offset does not fit u32".into())
-        })?;
-        let static_offset = u32::try_from(static_weight.storage_offset()).map_err(|_| {
-            GoldyError::Validation(
-                "dynamic short conv static-weight offset does not fit u32".into(),
-            )
-        })?;
-        let taps_offset = u32::try_from(taps.storage_offset()).map_err(|_| {
-            GoldyError::Validation("dynamic short conv tap offset does not fit u32".into())
-        })?;
-        let state_offset = u32::try_from(state.storage_offset()).map_err(|_| {
-            GoldyError::Validation("dynamic short conv state offset does not fit u32".into())
-        })?;
-        let out_offset = u32::try_from(out.storage_offset()).map_err(|_| {
-            GoldyError::Validation("dynamic short conv output offset does not fit u32".into())
-        })?;
-        let channels = x.shape().dim(0)?;
-        let heads = taps.shape().dim(0)?;
-        let kernel = state.shape().dim(1)?;
         self.dynamic_short_conv
             .record(
                 scheme,
                 "dynamic_short_conv",
-                x.buffer(),
-                static_weight.buffer(),
-                taps.buffer(),
-                state.buffer(),
-                out.buffer(),
-                x_offset,
-                static_offset,
-                taps_offset,
-                state_offset,
-                out_offset,
-                channels,
-                heads,
-                kernel,
-            )
-            .over_1d(channels);
+                x,
+                static_weight,
+                taps,
+                state,
+                out,
+            )?
+            .over_tensor(&x);
         Ok(())
     }
 

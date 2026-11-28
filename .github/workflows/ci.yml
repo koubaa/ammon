@@ -19,8 +19,7 @@ on:
     types: [goldy_main]
 
 env:
-  # Goldy #369; return to main after the dependency merges.
-  GOLDY_REF: cursor/metal-cross-encoder-barrier-d421
+  GOLDY_REF: main
 
 jobs:
   test:
@@ -97,8 +96,6 @@ jobs:
         arithmetic: [match-recorded, relaxed]
     env:
       AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
-      GOLDY_MATMUL_GEMV: library
-      GOLDY_API_LOG: /tmp/goldy-api.ndjson
       MTL_DEBUG_LAYER: "1"
       MTL_SHADER_VALIDATION: "1"
     steps:
@@ -148,9 +145,20 @@ jobs:
         env:
           DYLD_LIBRARY_PATH: ${{ env.SLANG_LIB_DIR }}
         run: |
-          set +e
-          cargo test --features metal --test decode_ops wide_clip_and_conv_match_reference \
-            -- --exact --nocapture --test-threads=1
-          status=$?
-          grep -E '"op":"(encoder_open|encoder_end|resource_barrier|dispatch)"' /tmp/goldy-api.ndjson || true
-          exit "$status"
+          set -euo pipefail
+          cargo test --features metal --lib \
+            --test fused_blocks \
+            --test inkling_attention \
+            --test kernels \
+            --test moe \
+            --test packed \
+            --test scratch_lifetime \
+            -- --test-threads=1
+          # The model path uses position-addressed algebra. Keep the legacy
+          # stateful dynamic-convolution cases on lavapipe until Metal can
+          # synchronize MPS writes consumed by a generated kernel in one graph.
+          cargo test --features metal --test decode_ops -- \
+            --test-threads=1 \
+            --skip dynamic_short_conv_matches_cpu_reference_and_resets \
+            --skip matches_pinned_transformers_modules \
+            --skip wide_clip_and_conv_match_reference

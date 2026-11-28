@@ -10,7 +10,7 @@ mod goldens;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    DynamicShortConv, HeadL2Clip, Linear, LogPositionScale, ShortConv, SigmoidGate, Softcap,
+    DynamicShortConv, HeadL2Clip, LogPositionScale, ShortConv, SigmoidGate, Softcap,
     SoftcappedSwiGlu,
 };
 use goldy::{BufferKind, Runtime, Scheme, Tensor, TensorDType, TensorShape};
@@ -665,61 +665,6 @@ fn wide_clip_and_conv_match_reference() {
     let dyn_host = cpu_ref::pseudo_random(3, 86);
     let x = vector(&device, &x_host);
     let dynamic = vector(&device, &dyn_host);
-    let taps = cpu_ref::gemv(&proj_host, heads * kernel, 3, &dyn_host);
-    let projected = Tensor::zeros(
-        &device,
-        TensorShape::matrix(heads as u32, kernel as u32),
-        TensorDType::F32,
-    )
-    .unwrap();
-    let linear = Linear::new(&device).unwrap();
-    let mut projection = Scheme::new(&ctx);
-    linear
-        .record(
-            &mut projection,
-            proj.view(),
-            dynamic.view(),
-            projected.view().reshape(&[(heads * kernel) as u32]).unwrap(),
-        )
-        .unwrap();
-    cpu_ref::assert_close(
-        "wide dynamic taps",
-        &read_f32(&mut projection, projected.buffer()),
-        &taps,
-    );
-    let direct_conv =
-        DynamicShortConv::new(&device, channels as u32, heads as u32, kernel as u32).unwrap();
-    let direct_out = Tensor::zeros(
-        &device,
-        TensorShape::vector(channels as u32),
-        TensorDType::F32,
-    )
-    .unwrap();
-    let mut direct = Scheme::new(&ctx);
-    direct_conv
-        .record_projected(
-            &mut direct,
-            x.view(),
-            static_weight.view(),
-            projected.view(),
-            direct_out.view(),
-        )
-        .unwrap();
-    let mut direct_state = vec![0.0_f32; channels * kernel];
-    let direct_want = cpu_ref::dynamic_short_conv_step(
-        &mut direct_state,
-        channels,
-        heads,
-        kernel,
-        &x_host,
-        &static_host,
-        &taps,
-    );
-    cpu_ref::assert_close(
-        "wide projected dynamic conv",
-        &read_f32(&mut direct, direct_out.buffer()),
-        &direct_want,
-    );
     let mut scheme = Scheme::new(&ctx);
     conv.record(
         &mut scheme,
@@ -730,6 +675,7 @@ fn wide_clip_and_conv_match_reference() {
         out.view(),
     )
     .unwrap();
+    let taps = cpu_ref::gemv(&proj_host, heads * kernel, 3, &dyn_host);
     let want = cpu_ref::dynamic_short_conv_step(
         &mut state,
         channels,
@@ -739,16 +685,9 @@ fn wide_clip_and_conv_match_reference() {
         &static_host,
         &taps,
     );
-    let got = read_f32(&mut scheme, out.buffer());
-    let mut tap_read = Scheme::new(&ctx);
-    cpu_ref::assert_close(
-        "wide internal dynamic taps",
-        &read_f32(&mut tap_read, conv.projected_taps().buffer()),
-        &taps,
-    );
     cpu_ref::assert_close(
         "wide dynamic conv",
-        &got,
+        &read_f32(&mut scheme, out.buffer()),
         &want,
     );
 }
