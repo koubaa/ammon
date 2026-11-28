@@ -8,8 +8,8 @@ use crate::decode_attn::{
     RelativeAttentionPartialKernel,
 };
 use crate::decode_ops::{
-    DynamicShortConvAtKernel, DynamicShortConvKernel, HeadL2ClipKernel, ShortConvAtKernel,
-    ShortConvKernel, SigmoidGateKernel, SoftcapKernel, SoftcappedSwiGluKernel,
+    DynamicShortConvKernel, HeadL2ClipKernel, ShortConvKernel, SigmoidGateKernel, SoftcapKernel,
+    SoftcappedSwiGluKernel,
 };
 use crate::depth::{DepthCopyRowsKernel, DepthMixKernel, DepthStoreKernel};
 use crate::kernels::{
@@ -44,9 +44,7 @@ pub(crate) struct Blocks {
     sigmoid_gate: SigmoidGateKernel,
     softcapped_swiglu: SoftcappedSwiGluKernel,
     short_conv: ShortConvKernel,
-    short_conv_at: ShortConvAtKernel,
     dynamic_short_conv: DynamicShortConvKernel,
-    dynamic_short_conv_at: DynamicShortConvAtKernel,
     runtime: Runtime,
     kv_cache_store: KvCacheStoreKernel,
     /// Serial reference. The recorded path is the split-K pair.
@@ -149,12 +147,8 @@ impl Blocks {
             softcapped_swiglu: SoftcappedSwiGluKernel::prepare(runtime)
                 .context("prepare softcapped_swiglu kernel")?,
             short_conv: ShortConvKernel::prepare(runtime).context("prepare short_conv kernel")?,
-            short_conv_at: ShortConvAtKernel::prepare(runtime)
-                .context("prepare short_conv_at kernel")?,
             dynamic_short_conv: DynamicShortConvKernel::prepare(runtime)
                 .context("prepare dynamic_short_conv kernel")?,
-            dynamic_short_conv_at: DynamicShortConvAtKernel::prepare(runtime)
-                .context("prepare dynamic_short_conv_at kernel")?,
             runtime: runtime.clone(),
             kv_cache_store: KvCacheStoreKernel::prepare(runtime)
                 .context("prepare kv_cache_store kernel")?,
@@ -523,11 +517,45 @@ impl Blocks {
                 "l2 clip: heads must be non-zero".into(),
             ));
         }
-        self.head_l2_clip
+        let node = self
+            .head_l2_clip
             .record(
                 scheme, "l2_clip", x, scale, out, step, threshold, alpha, floor, use_scale,
             )?
-            .groups([heads, 1, 1]);
+            .groups([heads, 1, 1])
+            .node();
+        // The log-position factor reads the position as a number, which no site states.
+        if alpha != 0.0 {
+            return Ok(());
+        }
+        let scaled = Tensor::zeros(&self.runtime, x.shape(), TensorDType::F32)?;
+        let square = Tensor::zeros(&self.runtime, x.shape(), TensorDType::F32)?;
+        let factor = Tensor::zeros(
+            &self.runtime,
+            TensorShape::matrix(heads, 1),
+            TensorDType::F32,
+        )?;
+        // The kernel sums each head across 256 lanes, so the sequential sum is not its order.
+        self.tensors.recorder(scheme).describe(node, false, |rec| {
+            let y = if use_scale != 0 {
+                rec.mul_into("l2_scale", x, scale, scaled.view())?;
+                scaled.view()
+            } else {
+                x
+            };
+            let f = factor.view();
+            rec.mul_into("l2_square", y, y, square.view())?;
+            rec.sum_into("l2_sum", square.view(), 1, f)?;
+            rec.sqrt_into("l2_norm", f, f)?;
+            rec.add_scalar_into("l2_eps", f, crate::decode_ops::L2_CLIP_NORM_EPS, f)?;
+            rec.reciprocal_into("l2_inverse", f, f)?;
+            rec.mul_scalar_into("l2_ratio", f, threshold, f)?;
+            rec.min_scalar_into("l2_factor", f, 1.0, f)?;
+            rec.mul_into("l2_clip", y, f, out)
+        })?;
+        for scratch in [scaled, square, factor] {
+            scheme.keep_alive(scratch);
+        }
         Ok(())
     }
 
@@ -627,7 +655,7 @@ impl Blocks {
 
     /// Causal convolution over the cyclic window `state` at position `step`, as
     /// tensor operations: the row dot, the skip connection, and the scale.
-    pub(crate) fn record_fusable_short_conv_at(
+    pub(crate) fn record_short_conv_at(
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
@@ -658,21 +686,10 @@ impl Blocks {
         Ok(())
     }
 
-    pub(crate) fn record_short_conv_at(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        weight: TensorView<'_>,
-        state: TensorView<'_>,
-        step: &Buffer,
-        out: TensorView<'_>,
-    ) -> Result<(), GoldyError> {
-        self.short_conv_at
-            .record(scheme, "short_conv_at", x, weight, state, out, step)?
-            .over_tensor(&x);
-        Ok(())
-    }
-
+    /// Dynamic causal convolution over the cyclic window `state` at position `step`,
+    /// as tensor operations. Weight column `kernel - 1 - lag` is
+    /// `static_weight[lag] + taps[head, lag]`, so the row dot reads the newest
+    /// value against tap 0, the same lag order as the authored kernel.
     pub(crate) fn record_dynamic_short_conv_at(
         &self,
         scheme: &mut Scheme,
@@ -683,18 +700,59 @@ impl Blocks {
         step: &Buffer,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.dynamic_short_conv_at
-            .record(
-                scheme,
-                "dynamic_short_conv_at",
-                x,
-                static_weight,
-                taps,
-                state,
-                out,
-                step,
-            )?
-            .over_tensor(&x);
+        let channels = x.shape().dim(0)?;
+        let kernel = state.shape().dim(1)?;
+        let heads = taps.shape().dim(0)?;
+        if static_weight.shape().dims() != [kernel, channels]
+            || taps.shape().dims() != [heads, kernel]
+            || heads == 0
+            || channels % heads != 0
+        {
+            return Err(GoldyError::Validation(
+                "dynamic conv: static weight is [kernel, channels] and taps [heads, kernel]".into(),
+            ));
+        }
+        let head_dim = channels / heads;
+        let position = TensorView::new(
+            step,
+            TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
+        )?;
+        // Tap-major, so each tap's sum is one contiguous block.
+        let weight = Tensor::zeros(
+            &self.runtime,
+            TensorShape::from_dims(&[kernel, heads, head_dim])?,
+            TensorDType::F32,
+        )?;
+        let rows = [heads, head_dim];
+        let row_shape = TensorShape::from_dims(&rows)?;
+        let dot = Tensor::zeros(&self.runtime, row_shape, TensorDType::F32)?;
+        let summed = Tensor::zeros(&self.runtime, row_shape, TensorDType::F32)?;
+        let x = x.reshape(&rows)?;
+        let state = state.reshape(&[heads, head_dim, kernel])?;
+        let out = out.reshape(&rows)?;
+        let mut rec = self.tensors.recorder(scheme);
+        rec.cyclic_store_at("short_conv_store", x, state, position)?;
+        for lag in 0..kernel {
+            let column = weight
+                .view()
+                .narrow(0, kernel - 1 - lag, 1)?
+                .reshape(&rows)?;
+            let fixed = static_weight.narrow(0, lag, 1)?.reshape(&rows)?;
+            let tap = taps.narrow(1, lag, 1)?;
+            rec.add_into("short_conv_weight", fixed, tap, column)?;
+        }
+        let window = weight.view().permute(&[1, 2, 0])?;
+        rec.cyclic_window_dot_at("short_conv_dot", window, state, position, dot.view())?;
+        rec.add_into("short_conv_skip", dot.view(), x, summed.view())?;
+        rec.div_scalar_into(
+            "short_conv_scale",
+            summed.view(),
+            (2.0 * (kernel as f32) + 1.0).sqrt(),
+            out,
+        )?;
+        for scratch in [weight, dot, summed] {
+            scheme.keep_alive(scratch);
+        }
         Ok(())
     }
 
@@ -773,7 +831,8 @@ impl Blocks {
         step: &Buffer,
         window: u32,
     ) -> Result<(), GoldyError> {
-        self.kv_cache_store
+        let node = self
+            .kv_cache_store
             .record(
                 scheme,
                 "kv_cache_store",
@@ -784,8 +843,22 @@ impl Blocks {
                 step,
                 window,
             )?
-            .over_tensor(&k);
-        Ok(())
+            .over_tensor(&k)
+            .node();
+        // A full cache skips positions past its allocation, which a cyclic store would wrap.
+        if window == 0 {
+            return Ok(());
+        }
+        let position = TensorView::new(
+            step,
+            TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
+        )?;
+        let keys = key_cache.permute(&[1, 2, 0])?;
+        let values = value_cache.permute(&[1, 2, 0])?;
+        self.tensors.recorder(scheme).describe(node, true, |rec| {
+            rec.cyclic_store_at("kv_store_key", k, keys, position)?;
+            rec.cyclic_store_at("kv_store_value", v, values, position)
+        })
     }
 
     /// Serial reference for [`Self::record_relative_attention_partial`]. Not used

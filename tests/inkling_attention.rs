@@ -222,16 +222,20 @@ impl Layer {
 
 /// Inference arithmetic against the reference, then the exact graph fused and unfused.
 fn run(spec: Spec, w: Weights<'_>, steps: &[Step<'_>]) {
-    matches_reference(&spec, &w, steps);
+    matches_reference(&spec, &w, steps, false);
+    matches_reference(&spec, &w, steps, true);
     fused_matches_unfused(&spec, &w, steps);
 }
 
-fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>]) {
+/// The inference scheme against the reference. With `fusion`, the scheme settles on
+/// the first step, and the key clip and a ring cache store run inside fused regions.
+fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: bool) {
     let device = runtime();
     let ctx = device.create_context().unwrap();
     let layer = Layer::new(&device, spec, w);
     let mut recorded = Scheme::new(&ctx);
     configure_inference_scheme(&mut recorded);
+    recorded.set_automatic_fusion(fusion);
     // Specialization re-records while it warms up, so a short step list may
     // never observe a clean submit. The replay check is about command buffers.
     let _spec = goldy::test_support::SpecializationOverride::force_disabled();
@@ -243,12 +247,28 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>]) {
     for (i, &step) in steps.iter().enumerate() {
         layer.load(&deposit, i, step);
         let _ = upload.submit().unwrap();
+        if i == 0 && fusion {
+            settle_fusion(&mut recorded);
+        }
         let _ = recorded.submit().unwrap();
         let mut read = Scheme::new(&ctx);
         let got = read_f32(&mut read, layer.out.buffer());
         let y = step.3;
         let err = max_abs(&got, y);
         assert!(err <= 1e-5, "step {i} max abs {err} got {got:?} want {y:?}");
+    }
+    if fusion {
+        let report = recorded.fusion_report();
+        let fused = |name: &str| {
+            report.regions.iter().any(|region| {
+                matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                    && region.labels.iter().any(|label| label.to_string() == name)
+            })
+        };
+        assert!(fused("l2_clip"), "no fused clip: {report:?}");
+        if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
+            assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
+        }
     }
     let stats = recorded.replay_stats();
     assert_eq!(

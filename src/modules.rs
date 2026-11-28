@@ -720,7 +720,7 @@ impl ShortConv {
             ));
         }
         self.blocks
-            .record_fusable_short_conv_at(scheme, x, weight, state, step, out)
+            .record_short_conv_at(scheme, x, weight, state, step, out)
     }
 }
 
