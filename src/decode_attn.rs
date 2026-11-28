@@ -188,9 +188,10 @@ fn relative_attention(
 ///
 /// Compact key `i` is logical position `start + i`. A ring maps that through
 /// `logical % capacity`. The bias uses the logical distance. Splits that start
-/// at or past the visible count return without writing; the combine reads only
-/// the live prefix. A full-cache position past `capacity` returns without
-/// writing so it cannot read off the end.
+/// at or past the visible count store the combine's identity (zero sums and a
+/// max of `-1e30`), so every split is defined. A full-cache position past
+/// `capacity` reads no keys and stores NaN sums, which the combine turns into
+/// a NaN head.
 #[goldy::compute(workgroup_size = [128, 1, 1])]
 fn relative_attention_partial(
     #[tensor(shape = [q_heads, head])] q: goldy::gpu::Tensor<f32>,
@@ -220,6 +221,15 @@ fn relative_attention_partial(
     let pos = step[0].position;
     if window == 0 {
         if pos >= capacity {
+            // NaN sums with a finite max, so the combine stores NaN without reading keys.
+            let out = (h * splits + split) * partial.dim(2);
+            if local < head {
+                partial[out + local] = 0.0 / 0.0;
+            }
+            if local == 0 {
+                partial[out + head] = 0.0;
+                partial[out + head + 1] = 0.0 / 0.0;
+            }
             return;
         }
     }
@@ -243,15 +253,14 @@ fn relative_attention_partial(
     }
     let t_begin = split * per;
     if t_begin >= n {
-        if bounded {
-            let out = (h * splits + split) * partial.dim(2);
-            if local < head {
-                partial[out + local] = 0.0;
-            }
-            if local == 0 {
-                partial[out + head] = -1.0e30;
-                partial[out + head + 1] = 0.0;
-            }
+        // A split past the visible span is the combine's identity: no weight and no sum.
+        let out = (h * splits + split) * partial.dim(2);
+        if local < head {
+            partial[out + local] = 0.0;
+        }
+        if local == 0 {
+            partial[out + head] = -1.0e30;
+            partial[out + head + 1] = 0.0;
         }
         return;
     }

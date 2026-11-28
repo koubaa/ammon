@@ -151,6 +151,21 @@ pub(crate) struct ClipScratch<'a> {
     pub factor: TensorView<'a>,
 }
 
+/// Scratch of the split-attention combine described as tensor operations. Per split:
+/// the max shift and the shifted weight, each `[q_heads, splits, 1]`, and the shifted
+/// sum, `[q_heads, splits, head]`. Per head: the numerator, `[q_heads, 1, head]`, and
+/// the top, the denominator and the sink weight, each `[q_heads, 1, 1]`.
+#[derive(Clone, Copy)]
+pub(crate) struct CombineScratch<'a> {
+    pub shift: TensorView<'a>,
+    pub weighted: TensorView<'a>,
+    pub scaled: TensorView<'a>,
+    pub numer: TensorView<'a>,
+    pub top: TensorView<'a>,
+    pub denom: TensorView<'a>,
+    pub sink_weight: TensorView<'a>,
+}
+
 impl Blocks {
     pub(crate) fn shared(runtime: &Runtime) -> anyhow::Result<Arc<Self>> {
         let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -920,9 +935,39 @@ impl Blocks {
         step: &Buffer,
         window: u32,
         capacity: u32,
+        scratch: CombineScratch<'_>,
     ) -> Result<(), GoldyError> {
         let q_heads = out.shape().dim(0)?;
-        self.relative_attention_combine
+        let splits = partial.shape().dim(1)?;
+        let head = out.shape().dim(1)?;
+        let CombineScratch {
+            shift,
+            weighted,
+            scaled,
+            numer,
+            top,
+            denom,
+            sink_weight,
+        } = scratch;
+        let per_split = |len| [q_heads, splits, len];
+        let per_head = |len| [q_heads, 1, len];
+        for (what, view, dims) in [
+            ("shift", shift, per_split(1)),
+            ("weighted", weighted, per_split(1)),
+            ("scaled", scaled, per_split(head)),
+            ("numer", numer, per_head(head)),
+            ("top", top, per_head(1)),
+            ("denom", denom, per_head(1)),
+            ("sink_weight", sink_weight, per_head(1)),
+        ] {
+            if view.shape().dims() != dims {
+                return Err(GoldyError::Validation(format!(
+                    "attention combine: {what} scratch must be {dims:?}"
+                )));
+            }
+        }
+        let node = self
+            .relative_attention_combine
             .record(
                 scheme,
                 "relative_attention_combine",
@@ -933,8 +978,35 @@ impl Blocks {
                 window,
                 capacity,
             )?
-            .groups([q_heads, 1, 1]);
-        Ok(())
+            .groups([q_heads, 1, 1])
+            .node();
+        // Every split holds a defined (sum, max, weight) triple: unused splits store the
+        // identity, so the combine is a fixed reduction over the split axis. The kernel
+        // reads only the live prefix, and the identity adds nothing to it.
+        let acc = partial.narrow(2, 0, head)?;
+        let maxes = partial.narrow(2, head, 1)?;
+        let weights = partial.narrow(2, head + 1, 1)?;
+        let sink = sink.reshape(&[q_heads, 1, 1])?;
+        // The kernel sums splits across lanes, so the sequential sums are not its order.
+        self.tensors.recorder(scheme).describe(node, false, |rec| {
+            rec.max_reduce_into("combine_max", maxes, 1, top)?;
+            rec.max_into("combine_sink_max", top, sink, top)?;
+            rec.sub_into("combine_shift", maxes, top, shift)?;
+            rec.exp_into("combine_scale", shift, shift)?;
+            rec.mul_into("combine_scaled", acc, shift, scaled)?;
+            rec.sum_into("combine_numer", scaled, 1, numer)?;
+            rec.mul_into("combine_weighted", weights, shift, weighted)?;
+            rec.sum_into("combine_denom", weighted, 1, denom)?;
+            rec.sub_into("combine_sink_shift", sink, top, sink_weight)?;
+            rec.exp_into("combine_sink_scale", sink_weight, sink_weight)?;
+            rec.add_into("combine_norm", denom, sink_weight, denom)?;
+            rec.div_into(
+                "combine_out",
+                numer.reshape(&[q_heads, head])?,
+                denom.reshape(&[q_heads, 1])?,
+                out,
+            )
+        })
     }
 
     pub(crate) fn record_moe_topk(
