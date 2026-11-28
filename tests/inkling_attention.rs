@@ -286,11 +286,16 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     .count()
             })
             .sum();
-        assert_eq!(
-            clips,
-            if relaxed { 2 } else { 0 },
-            "fused clips: {report:?}"
-        );
+        // Metal cannot realize the reduction order of the native projection that
+        // feeds an unscaled relative clip, so that clip stays a dispatch of its own.
+        let metal = device.backend_type() == goldy::BackendType::Metal;
+        let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
+        let expected = match (relaxed, metal && !logged) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => 2,
+        };
+        assert_eq!(clips, expected, "fused clips: {report:?}");
         assert_eq!(
             fused("relative_attention_combine"),
             relaxed,
