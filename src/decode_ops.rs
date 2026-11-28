@@ -166,25 +166,28 @@ fn short_conv(
 /// `sqrt(2 * kernel + 1)`, not the static one.
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn dynamic_short_conv(
-    #[tensor(shape = [channels])] x: goldy::gpu::Tensor<f32>,
+    x: &[f32],
     static_weight: &[f32],
     taps: &[f32],
-    #[tensor(shape = [channels, kernel])] state: goldy::gpu::TensorMut<f32>,
-    #[tensor(shape = [channels])] out: goldy::gpu::TensorWrite<f32>,
+    state: &mut [f32],
+    out: &mut [f32],
+    x_offset: u32,
     static_offset: u32,
     taps_offset: u32,
+    state_offset: u32,
+    out_offset: u32,
+    channels: u32,
     heads: u32,
+    kernel: u32,
 ) {
     let c = goldy::gpu::global_id().x;
-    if c >= x.len() {
+    if c >= channels {
         return;
     }
-    let kernel = state.dim(1);
-    let channels = x.len();
     let head_dim = channels / heads;
     let head = c / head_dim;
-    let base = c * kernel;
-    let cur = x[c];
+    let base = state_offset + c * kernel;
+    let cur = x[x_offset + c];
     let mut acc = (static_weight[static_offset + c] + taps[taps_offset + head * kernel]) * cur;
     let mut lag = 1u32;
     while lag < kernel {
@@ -201,7 +204,7 @@ fn dynamic_short_conv(
         k = k + 1;
     }
     state[base + last] = cur;
-    out[c] = (acc + cur) / goldy::gpu::sqrt((2.0 * (kernel as f32)) + 1.0);
+    out[out_offset + c] = (acc + cur) / goldy::gpu::sqrt((2.0 * (kernel as f32)) + 1.0);
 }
 
 pub use dynamic_short_conv::Kernel as DynamicShortConvKernel;
