@@ -4,8 +4,7 @@
 # as siblings. GPU tests are not optional: the job fails if lavapipe is missing
 # or does not advertise Vulkan 1.4.
 #
-# GOLDY_REF is the goldy checkout. While koubaa/goldy#360 is open it pins that
-# branch, which adds the max_reduce_into the combine's description records.
+# GOLDY_REF is the goldy checkout.
 # Indexed GEMV reads the slab in place, and a unit softcap is one tanh
 # inside goldy. Retained command buffers keep their own frame-table rows.
 
@@ -20,7 +19,8 @@ on:
     types: [goldy_main]
 
 env:
-  GOLDY_REF: cursor/reduce-into-forms-06c6
+  # Goldy #369; return to main after the dependency merges.
+  GOLDY_REF: cursor/metal-cross-encoder-barrier-d421
 
 jobs:
   test:
@@ -98,7 +98,6 @@ jobs:
     env:
       AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
       GOLDY_MATMUL_GEMV: library
-      GOLDY_PARTITION_SPLIT: barrier
       MTL_DEBUG_LAYER: "1"
       MTL_SHADER_VALIDATION: "1"
     steps:
