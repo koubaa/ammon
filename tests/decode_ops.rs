@@ -10,7 +10,7 @@ mod goldens;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    DynamicShortConv, HeadL2Clip, LogPositionScale, ShortConv, SigmoidGate, Softcap,
+    DynamicShortConv, HeadL2Clip, Linear, LogPositionScale, ShortConv, SigmoidGate, Softcap,
     SoftcappedSwiGlu,
 };
 use goldy::{BufferKind, Runtime, Scheme, Tensor, TensorDType, TensorShape};
@@ -665,6 +665,28 @@ fn wide_clip_and_conv_match_reference() {
     let dyn_host = cpu_ref::pseudo_random(3, 86);
     let x = vector(&device, &x_host);
     let dynamic = vector(&device, &dyn_host);
+    let taps = cpu_ref::gemv(&proj_host, heads * kernel, 3, &dyn_host);
+    let projected = Tensor::zeros(
+        &device,
+        TensorShape::vector((heads * kernel) as u32),
+        TensorDType::F32,
+    )
+    .unwrap();
+    let linear = Linear::new(&device).unwrap();
+    let mut projection = Scheme::new(&ctx);
+    linear
+        .record(
+            &mut projection,
+            proj.view(),
+            dynamic.view(),
+            projected.view(),
+        )
+        .unwrap();
+    cpu_ref::assert_close(
+        "wide dynamic taps",
+        &read_f32(&mut projection, projected.buffer()),
+        &taps,
+    );
     let mut scheme = Scheme::new(&ctx);
     conv.record(
         &mut scheme,
@@ -675,7 +697,6 @@ fn wide_clip_and_conv_match_reference() {
         out.view(),
     )
     .unwrap();
-    let taps = cpu_ref::gemv(&proj_host, heads * kernel, 3, &dyn_host);
     let want = cpu_ref::dynamic_short_conv_step(
         &mut state,
         channels,
