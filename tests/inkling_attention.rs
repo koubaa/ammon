@@ -12,10 +12,12 @@ mod goldens;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    configure_inference_scheme, DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights,
-    DecodeLayerState, LogPositionScale,
+    configure_inference_scheme, inference_arithmetic_policy, DecodeAttention, DecodeAttentionKind,
+    DecodeAttentionWeights, DecodeLayerState, LogPositionScale,
 };
-use goldy::{BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape};
+use goldy::{
+    ArithmeticPolicy, BufferKind, MemoryExchange, Runtime, Scheme, Tensor, TensorDType, TensorShape,
+};
 
 fn runtime() -> Runtime {
     create_runtime().expect("goldy runtime")
@@ -268,11 +270,11 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        assert!(fused("l2_clip"), "no fused clip: {report:?}");
-        assert!(
-            fused("relative_attention_combine"),
-            "no fused combine: {report:?}"
-        );
+        // Both describe reassociated sums, so they fuse only under relaxed arithmetic.
+        let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
+        for name in ["l2_clip", "relative_attention_combine"] {
+            assert_eq!(fused(name), relaxed, "{name} fused: {report:?}");
+        }
         if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
             assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
         }
@@ -772,16 +774,15 @@ fn full_cache_replay_past_capacity(fusion: bool) {
     if fusion {
         settle_fusion(&mut recorded);
         let report = recorded.fusion_report();
-        assert!(
-            report.regions.iter().any(|region| {
-                matches!(region.status, goldy::FusionRegionStatus::Promoted)
-                    && region
-                        .labels
-                        .iter()
-                        .any(|label| label.to_string() == "relative_attention_combine")
-            }),
-            "no fused combine: {report:?}"
-        );
+        let combined = report.regions.iter().any(|region| {
+            matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                && region
+                    .labels
+                    .iter()
+                    .any(|label| label.to_string() == "relative_attention_combine")
+        });
+        let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
+        assert_eq!(combined, relaxed, "combine fused: {report:?}");
     }
     let mut read = Scheme::new(&ctx);
     let after_zero = read_f32(&mut read, cache.keys().buffer());
