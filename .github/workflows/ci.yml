@@ -86,3 +86,63 @@ jobs:
       - name: Vulkan tests
         working-directory: ammon
         run: cargo test --features vulkan -- --test-threads=1
+
+  metal:
+    name: Metal (${{ matrix.arithmetic }})
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arithmetic: [match-recorded, relaxed]
+    env:
+      AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
+      MTL_DEBUG_LAYER: "1"
+      MTL_SHADER_VALIDATION: "1"
+    steps:
+      - name: Checkout ammon
+        uses: actions/checkout@v4
+        with:
+          path: ammon
+
+      - name: Checkout goldy
+        uses: actions/checkout@v4
+        with:
+          repository: koubaa/goldy
+          ref: ${{ env.GOLDY_REF }}
+          path: goldy
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download Slang compiler
+        working-directory: goldy/slang
+        run: |
+          set -euo pipefail
+          chmod +x download.sh
+          ./download.sh
+          if [ "$(uname -m)" = "arm64" ]; then
+            SLANG_DIR="$(pwd)/bin/macos-aarch64"
+          else
+            SLANG_DIR="$(pwd)/bin/macos-x86_64"
+          fi
+          echo "GOLDY_SLANG_PATH=$SLANG_DIR/libslang.dylib" >> "$GITHUB_ENV"
+          echo "SLANG_LIB_DIR=$SLANG_DIR" >> "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ammon/target
+          key: ${{ runner.os }}-cargo-metal-${{ hashFiles('ammon/Cargo.lock', 'goldy/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-metal-
+
+      - name: Metal tests
+        working-directory: ammon
+        env:
+          DYLD_LIBRARY_PATH: ${{ env.SLANG_LIB_DIR }}
+        run: cargo test --features metal -- --test-threads=1
