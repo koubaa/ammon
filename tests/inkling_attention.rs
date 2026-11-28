@@ -270,7 +270,7 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        // The key and relative clips, log-scaled or not. The query clip writes in place.
+        // The query, key and relative clips, log-scaled or not.
         // Clips and the combine describe reassociated sums, so they fuse only under
         // relaxed arithmetic.
         let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
@@ -292,8 +292,8 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
         let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
         let expected = match (relaxed, metal && !logged) {
             (false, _) => 0,
-            (true, true) => 1,
-            (true, false) => 2,
+            (true, true) => 2,
+            (true, false) => 3,
         };
         assert_eq!(clips, expected, "fused clips: {report:?}");
         assert_eq!(
