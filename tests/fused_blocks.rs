@@ -10,8 +10,8 @@ mod cpu_ref;
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::{
-    configure_inference_scheme, CausalAttentionBlock, CausalAttentionBlockWeights, KvCache,
-    SwiGluBlock, SwiGluBlockWeights,
+    configure_inference_scheme, CausalAttentionBlock, CausalAttentionBlockWeights, DepthMix,
+    KvCache, SwiGluBlock, SwiGluBlockWeights,
 };
 use goldy::{BufferKind, Runtime, Scheme, Tensor, TensorShape};
 
@@ -255,4 +255,61 @@ fn fused_swiglu_block_matches_unfused_bits() {
             .collect::<Vec<u32>>()
     };
     assert_eq!(run(true), run(false));
+}
+
+/// A tape row store is described as a copy into its row, so under `MatchRecorded` it
+/// fuses with the add that produces the row and stores the same bytes.
+#[test]
+fn tape_row_store_fuses_with_its_producer() {
+    let device = runtime();
+    let ctx = device.create_context().unwrap();
+    let (hidden, rows, slot) = (64u32, 4u32, 2u32);
+    let depth = DepthMix::new(&device).unwrap();
+    let a_h = cpu_ref::pseudo_random(hidden as usize, 111);
+    let b_h = cpu_ref::pseudo_random(hidden as usize, 112);
+    let tape_h = cpu_ref::pseudo_random((rows * hidden) as usize, 113);
+    let run = |fusion: bool| {
+        let vector =
+            |data: &[f32]| Tensor::from_f32(&device, TensorShape::vector(hidden), data).unwrap();
+        let (a, b, sum) = (
+            vector(&a_h),
+            vector(&b_h),
+            vector(&vec![0.0; hidden as usize]),
+        );
+        let tape = Tensor::from_f32(&device, TensorShape::matrix(rows, hidden), &tape_h).unwrap();
+        let mut scheme = Scheme::new(&ctx);
+        scheme.set_automatic_fusion(fusion);
+        depth
+            .add(&mut scheme, a.view(), b.view(), sum.view())
+            .unwrap();
+        depth
+            .store_row(&mut scheme, sum.view(), tape.view(), slot)
+            .unwrap();
+        if fusion {
+            settle_fusion(&mut scheme);
+            let report = scheme.fusion_report();
+            assert!(
+                report.regions.iter().any(|region| {
+                    matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                        && region.labels.iter().any(|l| l.to_string() == "depth_store")
+                }),
+                "{report:?}"
+            );
+            assert_eq!(scheme.executed_node_count(), 1, "{report:?}");
+        }
+        read_f32(&mut scheme, tape.buffer())
+    };
+    let fused = run(true);
+    assert_eq!(
+        fused.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        run(false).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    for (row, got) in fused.chunks(hidden as usize).enumerate() {
+        let want: Vec<f32> = if row == slot as usize {
+            a_h.iter().zip(&b_h).map(|(a, b)| a + b).collect()
+        } else {
+            tape_h[row * hidden as usize..][..hidden as usize].to_vec()
+        };
+        assert_eq!(got, want, "row {row}");
+    }
 }

@@ -230,7 +230,7 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[Step<'_>]) {
 }
 
 /// The inference scheme against the reference. With `fusion`, the scheme settles on
-/// the first step, and the key clip and a ring cache store run inside fused regions.
+/// the first step, and the key clip and the cache store run inside fused regions.
 fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: bool) {
     let device = runtime();
     let ctx = device.create_context().unwrap();
@@ -270,22 +270,39 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        if inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed {
-            assert!(fused("l2_clip"), "no fused clip: {report:?}");
-            assert!(
-                fused("relative_attention_combine"),
-                "no fused combine: {report:?}"
-            );
-        } else {
-            assert!(!fused("l2_clip"), "strict policy fused clip: {report:?}");
-            assert!(
-                !fused("relative_attention_combine"),
-                "strict policy fused combine: {report:?}"
-            );
-        }
-        if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
-            assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
-        }
+        // Every clip without a log scale: query, key and relative on a sliding layer.
+        // Clips and the combine describe reassociated sums, so they fuse only
+        // under relaxed arithmetic; the cache store is exact.
+        let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
+        let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
+        let clips: usize = report
+            .regions
+            .iter()
+            .filter(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted))
+            .map(|region| {
+                region
+                    .labels
+                    .iter()
+                    .filter(|label| label.to_string() == "l2_clip")
+                    .count()
+            })
+            .sum();
+        // Metal cannot realize the reduction order of the native projection that
+        // feeds an unscaled relative clip, so that clip stays a dispatch of its own.
+        let metal = device.backend_type() == goldy::BackendType::Metal;
+        let expected = match (relaxed, logged) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) if metal => 2,
+            (true, false) => 3,
+        };
+        assert_eq!(clips, expected, "fused clips: {report:?}");
+        assert_eq!(
+            fused("relative_attention_combine"),
+            relaxed,
+            "combine fused: {report:?}"
+        );
+        assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
     }
     let stats = recorded.replay_stats();
     assert_eq!(
@@ -794,6 +811,16 @@ fn full_cache_replay_past_capacity(fusion: bool) {
         } else {
             assert!(!combined, "strict policy fused combine: {report:?}");
         }
+        assert!(
+            report.regions.iter().any(|region| {
+                matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                    && region
+                        .labels
+                        .iter()
+                        .any(|label| label.to_string() == "kv_cache_store")
+            }),
+            "no fused cache store: {report:?}"
+        );
     }
     let mut read = Scheme::new(&ctx);
     let after_zero = read_f32(&mut read, cache.keys().buffer());
