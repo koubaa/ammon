@@ -979,11 +979,6 @@ impl ShortConv {
             .record_zero(scheme, "conv_reset", self.state.view())
     }
 
-    #[doc(hidden)]
-    pub fn projected_taps(&self) -> TensorView<'_> {
-        self.taps.view()
-    }
-
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -1101,6 +1096,11 @@ impl DynamicShortConv {
     pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
         self.blocks
             .record_zero(scheme, "conv_reset", self.state.view())
+    }
+
+    #[doc(hidden)]
+    pub fn projected_taps(&self) -> TensorView<'_> {
+        self.taps.view()
     }
 
     pub fn record(
