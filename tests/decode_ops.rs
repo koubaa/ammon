@@ -739,9 +739,16 @@ fn wide_clip_and_conv_match_reference() {
         &static_host,
         &taps,
     );
+    let got = read_f32(&mut scheme, out.buffer());
+    let mut tap_read = Scheme::new(&ctx);
+    cpu_ref::assert_close(
+        "wide internal dynamic taps",
+        &read_f32(&mut tap_read, conv.projected_taps().buffer()),
+        &taps,
+    );
     cpu_ref::assert_close(
         "wide dynamic conv",
-        &read_f32(&mut scheme, out.buffer()),
+        &got,
         &want,
     );
 }
