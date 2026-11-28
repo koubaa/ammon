@@ -98,6 +98,7 @@ jobs:
     env:
       AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
       GOLDY_MATMUL_GEMV: library
+      GOLDY_PARTITION_SPLIT: barrier
       MTL_DEBUG_LAYER: "1"
       MTL_SHADER_VALIDATION: "1"
     steps:
