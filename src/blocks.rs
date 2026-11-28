@@ -453,10 +453,10 @@ impl Blocks {
             )?
             .groups([heads, 1, 1])
             .node();
-        // The log-position factor reads the position as a number, which no site states.
-        if alpha != 0.0 {
-            return Ok(());
-        }
+        let position = TensorView::new(
+            step,
+            TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
+        )?;
         // The kernel sums each head across 256 lanes, so the sequential sum is not its order.
         self.tensors.recorder(scheme).describe(node, false, |rec| {
             let y = if use_scale != 0 {
@@ -475,6 +475,17 @@ impl Blocks {
             rec.reciprocal_into("l2_inverse", f, f)?;
             rec.mul_scalar_into("l2_ratio", f, threshold, f)?;
             rec.min_scalar_into("l2_factor", f, 1.0, f)?;
+            if alpha != 0.0 {
+                let t = rec.temporary(TensorShape::vector(1), TensorDType::F32)?;
+                rec.cast_into("l2_position", position, t)?;
+                rec.add_scalar_into("l2_next", t, 1.0, t)?;
+                rec.div_scalar_into("l2_per_floor", t, floor, t)?;
+                rec.max_scalar_into("l2_at_least_one", t, 1.0, t)?;
+                rec.log_into("l2_log", t, t)?;
+                rec.mul_scalar_into("l2_alpha", t, alpha, t)?;
+                rec.add_scalar_into("l2_log_scale", t, 1.0, t)?;
+                rec.mul_into("l2_log_factor", f, t, f)?;
+            }
             rec.mul_into("l2_clip", y, f, out)
         })
     }
