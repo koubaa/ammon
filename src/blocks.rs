@@ -700,7 +700,7 @@ impl Blocks {
                 channels,
                 heads,
                 kernel,
-            )?
+            )
             .over_1d(channels);
         Ok(())
     }
