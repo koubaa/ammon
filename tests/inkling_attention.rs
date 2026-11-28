@@ -256,6 +256,9 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
         let y = step.3;
         let err = max_abs(&got, y);
         assert!(err <= 1e-5, "step {i} max abs {err} got {got:?} want {y:?}");
+        if !fusion {
+            unused_splits_hold_the_identity(&ctx, spec, &layer, i as u32);
+        }
     }
     if fusion {
         let report = recorded.fusion_report();
@@ -266,6 +269,10 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
             })
         };
         assert!(fused("l2_clip"), "no fused clip: {report:?}");
+        assert!(
+            fused("relative_attention_combine"),
+            "no fused combine: {report:?}"
+        );
         if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
             assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
         }
@@ -279,6 +286,50 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
         stats.clean_submits > 0,
         "no clean replay submits: {stats:?}"
     );
+}
+
+/// Every split past the keys visible at `position` stores the combine's identity, so
+/// the combine may reduce over all of them.
+fn unused_splits_hold_the_identity(
+    ctx: &goldy::Context,
+    spec: &Spec,
+    layer: &Layer,
+    position: u32,
+) {
+    let partial = layer.state.partial();
+    let dims = partial.shape().dims().to_vec();
+    let (splits, slot) = (dims[1], dims[2] as usize);
+    let visible = match spec.kind {
+        DecodeAttentionKind::Sliding { window } => (position + 1).min(window),
+        DecodeAttentionKind::Full => (position + 1).min(spec.capacity),
+    };
+    let per = if visible.div_ceil(8) > splits {
+        visible.div_ceil(splits)
+    } else {
+        8
+    };
+    let mut read = Scheme::new(ctx);
+    let host = read_f32(&mut read, partial.buffer());
+    let mut unused = 0;
+    for h in 0..dims[0] as usize {
+        for s in (0..splits).filter(|s| s * per >= visible) {
+            let at = (h * splits as usize + s as usize) * slot;
+            let (sums, max, weight) = (
+                &host[at..at + slot - 2],
+                host[at + slot - 2],
+                host[at + slot - 1],
+            );
+            assert!(
+                sums.iter().all(|&v| v == 0.0) && max == -1.0e30 && weight == 0.0,
+                "position {position} split {s} of head {h}: {:?}",
+                &host[at..at + slot]
+            );
+            unused += 1;
+        }
+    }
+    if position == 0 && splits > 1 {
+        assert!(unused > 0, "no unused split at position 0");
+    }
 }
 
 /// Submits until the structure has replayed and no fused region is still compiling.
@@ -633,6 +684,13 @@ fn mini_head_counts_construct() {
 
 #[test]
 fn full_cache_replay_past_capacity_does_not_write() {
+    full_cache_replay_past_capacity(false);
+    full_cache_replay_past_capacity(true);
+}
+
+/// With `fusion`, the scheme settles on a valid position first, so the past-capacity
+/// replay runs the fused regions.
+fn full_cache_replay_past_capacity(fusion: bool) {
     let device = runtime();
     let ctx = device.create_context().unwrap();
     let attn = DecodeAttention::new(
@@ -697,6 +755,8 @@ fn full_cache_replay_past_capacity_does_not_write() {
     };
     let mut recorded = Scheme::new(&ctx);
     configure_inference_scheme(&mut recorded);
+    recorded.set_automatic_fusion(fusion);
+    let _spec = goldy::test_support::SpecializationOverride::force_disabled();
     attn.record(
         &mut recorded,
         hidden.view(),
@@ -709,6 +769,20 @@ fn full_cache_replay_past_capacity_does_not_write() {
     )
     .unwrap();
     let _ = recorded.submit().unwrap();
+    if fusion {
+        settle_fusion(&mut recorded);
+        let report = recorded.fusion_report();
+        assert!(
+            report.regions.iter().any(|region| {
+                matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                    && region
+                        .labels
+                        .iter()
+                        .any(|label| label.to_string() == "relative_attention_combine")
+            }),
+            "no fused combine: {report:?}"
+        );
+    }
     let mut read = Scheme::new(&ctx);
     let after_zero = read_f32(&mut read, cache.keys().buffer());
     assert!(after_zero.iter().any(|v| *v != 0.0), "{after_zero:?}");

@@ -1363,6 +1363,13 @@ impl DecodeLayerState {
         self.kv.keys()
     }
 
+    /// Split-attention scratch, `[q_heads, splits, head_dim + 2]`: each split's
+    /// weighted value sum, then its running max and its sum of exp. A split past the
+    /// visible span holds zero sums and a max of `-1e30`.
+    pub fn partial(&self) -> TensorView<'_> {
+        self.partial.view()
+    }
+
     /// Zeros the convolution state. KV rows are left alone: a new sequence
     /// rewrites every key it reads.
     pub fn record_reset(&self, scheme: &mut Scheme) -> Result<(), GoldyError> {
@@ -1725,8 +1732,9 @@ impl DecodeAttention {
         let attn_flat = self.attn.view().reshape(&[q_dim])?;
         self.linear
             .record(scheme, weights.wgate, q_hidden, self.gate_logits.view())?;
-        self.gate
-            .record(scheme, attn_flat, self.gate_logits.view())?;
+        // Gate per head, in the combine's own shape, so the combine's rows forward into it.
+        let gate_logits = self.gate_logits.view().reshape(self.attn.shape().dims())?;
+        self.gate.record(scheme, self.attn.view(), gate_logits)?;
         self.linear.record(scheme, weights.wo, attn_flat, out)?;
         Ok(())
     }

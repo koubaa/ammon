@@ -922,7 +922,8 @@ impl Blocks {
         capacity: u32,
     ) -> Result<(), GoldyError> {
         let q_heads = out.shape().dim(0)?;
-        self.relative_attention_combine
+        let node = self
+            .relative_attention_combine
             .record(
                 scheme,
                 "relative_attention_combine",
@@ -933,7 +934,64 @@ impl Blocks {
                 window,
                 capacity,
             )?
-            .groups([q_heads, 1, 1]);
+            .groups([q_heads, 1, 1])
+            .node();
+        // Every split holds a defined (sum, max, weight) triple: unused splits store the
+        // identity, so the combine is a fixed reduction over the split axis. The kernel
+        // reads only the live prefix, and the identity adds nothing to it.
+        let splits = partial.shape().dim(1)?;
+        let head = out.shape().dim(1)?;
+        let acc = partial.narrow(2, 0, head)?;
+        let maxes = partial.narrow(2, head, 1)?;
+        let weights = partial.narrow(2, head + 1, 1)?;
+        let sink = sink.reshape(&[q_heads, 1, 1])?;
+        let per_split = |len| {
+            Tensor::zeros(
+                &self.runtime,
+                TensorShape::from_dims(&[q_heads, splits, len])?,
+                TensorDType::F32,
+            )
+        };
+        let per_head = |len| {
+            Tensor::zeros(
+                &self.runtime,
+                TensorShape::from_dims(&[q_heads, 1, len])?,
+                TensorDType::F32,
+            )
+        };
+        let (shift, scaled, numer) = (per_split(1)?, per_split(head)?, per_head(head)?);
+        let (top, denom, sink_weight) = (per_head(1)?, per_head(1)?, per_head(1)?);
+        let weighted = per_split(1)?;
+        // The kernel sums splits across lanes, so the sequential sums are not its order.
+        self.tensors.recorder(scheme).describe(node, false, |rec| {
+            let (shift_v, top_v) = (shift.view(), top.view());
+            rec.max_reduce_into("combine_max", maxes, 1, top_v)?;
+            rec.max_into("combine_sink_max", top_v, sink, top_v)?;
+            rec.sub_into("combine_shift", maxes, top_v, shift_v)?;
+            rec.exp_into("combine_scale", shift_v, shift_v)?;
+            rec.mul_into("combine_scaled", acc, shift_v, scaled.view())?;
+            rec.sum_into("combine_numer", scaled.view(), 1, numer.view())?;
+            rec.mul_into("combine_weighted", weights, shift_v, weighted.view())?;
+            rec.sum_into("combine_denom", weighted.view(), 1, denom.view())?;
+            rec.sub_into("combine_sink_shift", sink, top_v, sink_weight.view())?;
+            rec.exp_into("combine_sink_scale", sink_weight.view(), sink_weight.view())?;
+            rec.add_into(
+                "combine_norm",
+                denom.view(),
+                sink_weight.view(),
+                denom.view(),
+            )?;
+            let numer = numer.view().reshape(&[q_heads, head])?;
+            rec.div_into(
+                "combine_out",
+                numer,
+                denom.view().reshape(&[q_heads, 1])?,
+                out,
+            )
+        })?;
+        for scratch in [shift, scaled, numer, top, denom, sink_weight, weighted] {
+            scheme.keep_alive(scratch);
+        }
         Ok(())
     }
 
