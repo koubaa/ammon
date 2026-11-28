@@ -270,19 +270,37 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        if inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed {
-            assert!(fused("l2_clip"), "no fused clip: {report:?}");
-            assert!(
-                fused("relative_attention_combine"),
-                "no fused combine: {report:?}"
-            );
-        } else {
-            assert!(!fused("l2_clip"), "strict policy fused clip: {report:?}");
-            assert!(
-                !fused("relative_attention_combine"),
-                "strict policy fused combine: {report:?}"
-            );
-        }
+        // The query, key and relative clips, log-scaled or not.
+        // Clips and the combine describe reassociated sums, so they fuse only under
+        // relaxed arithmetic.
+        let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
+        let clips: usize = report
+            .regions
+            .iter()
+            .filter(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted))
+            .map(|region| {
+                region
+                    .labels
+                    .iter()
+                    .filter(|label| label.to_string() == "l2_clip")
+                    .count()
+            })
+            .sum();
+        // Metal cannot realize the reduction order of the native projection that
+        // feeds an unscaled relative clip, so that clip stays a dispatch of its own.
+        let metal = device.backend_type() == goldy::BackendType::Metal;
+        let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
+        let expected = match (relaxed, metal && !logged) {
+            (false, _) => 0,
+            (true, true) => 2,
+            (true, false) => 3,
+        };
+        assert_eq!(clips, expected, "fused clips: {report:?}");
+        assert_eq!(
+            fused("relative_attention_combine"),
+            relaxed,
+            "combine fused: {report:?}"
+        );
         if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
             assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
         }
