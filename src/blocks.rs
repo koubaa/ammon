@@ -21,8 +21,8 @@ use crate::kernels::{
 use crate::moe::MoeTopkKernel;
 use anyhow::Context;
 use goldy::{
-    ArithmeticPolicy, Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorLayout,
-    TensorScalar, TensorShape, TensorView,
+    Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorLayout, TensorScalar,
+    TensorShape, TensorView,
 };
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -47,8 +47,6 @@ pub(crate) struct Blocks {
     short_conv_at: ShortConvAtKernel,
     dynamic_short_conv: DynamicShortConvKernel,
     dynamic_short_conv_at: DynamicShortConvAtKernel,
-    /// Tensor-algebra temps. The scheme does not own them.
-    algebra: Mutex<Vec<Tensor>>,
     runtime: Runtime,
     kv_cache_store: KvCacheStoreKernel,
     /// Serial reference. The recorded path is the split-K pair.
@@ -157,7 +155,6 @@ impl Blocks {
                 .context("prepare dynamic_short_conv kernel")?,
             dynamic_short_conv_at: DynamicShortConvAtKernel::prepare(runtime)
                 .context("prepare dynamic_short_conv_at kernel")?,
-            algebra: Mutex::new(Vec::new()),
             runtime: runtime.clone(),
             kv_cache_store: KvCacheStoreKernel::prepare(runtime)
                 .context("prepare kv_cache_store kernel")?,
@@ -190,10 +187,9 @@ impl Blocks {
         Ok(())
     }
 
-    /// RMSNorm into `out`. With `AMMON_SEMANTIC_NORM=1` under automatic fusion it is
-    /// recorded as tensor operations, which fuse into the projections that read `out`.
-    /// The mean square is then summed in order by one thread rather than across the
-    /// kernel's 256 lanes, which is slower at every width Ammon runs.
+    /// RMSNorm into `out`, described as tensor operations. The kernel sums the mean
+    /// square across 256 lanes, so the description is not exact and fuses only where
+    /// contractions may reassociate.
     ///
     /// `weight` is the gain. `None` is the unweighted form (`out = x * rsqrt(mean(x²) + eps)`).
     fn norm(
@@ -205,35 +201,35 @@ impl Blocks {
         scratch: NormScratch<'_>,
         eps: f32,
     ) -> Result<(), GoldyError> {
-        let semantic = std::env::var("AMMON_SEMANTIC_NORM").is_ok_and(|v| v == "1");
-        if !(semantic && scheme.automatic_fusion()) {
-            if let Some(weight) = weight {
-                self.rmsnorm
-                    .record(scheme, "rmsnorm", x, weight, out, eps)?
-                    .groups([1, 1, 1]);
-            } else {
-                self.rmsnorm_unweighted
-                    .record(scheme, "rmsnorm", x, out, eps)?
-                    .groups([1, 1, 1]);
-            }
-            return Ok(());
-        }
+        let node = match weight {
+            Some(weight) => self
+                .rmsnorm
+                .record(scheme, "rmsnorm", x, weight, out, eps)?
+                .groups([1, 1, 1])
+                .node(),
+            None => self
+                .rmsnorm_unweighted
+                .record(scheme, "rmsnorm", x, out, eps)?
+                .groups([1, 1, 1])
+                .node(),
+        };
         let NormScratch { square, scale } = scratch;
-        let mut rec = self.tensors.recorder(scheme);
-        rec.mul_into("rms_square", x, x, square)?;
-        rec.mean_into("rms_mean", square, 0, scale)?;
-        rec.add_scalar_into("rms_eps", scale, eps, scale)?;
-        rec.sqrt_into("rms_sqrt", scale, scale)?;
-        rec.reciprocal_into("rms_scale", scale, scale)?;
-        rec.mul_into("rms_normalize", scale, x, out)?;
-        if let Some(weight) = weight {
-            rec.mul_into("rms_weight", weight, out, out)?;
-        }
-        Ok(())
+        self.tensors.recorder(scheme).describe(node, false, |rec| {
+            rec.mul_into("rms_square", x, x, square)?;
+            rec.mean_into("rms_mean", square, 0, scale)?;
+            rec.add_scalar_into("rms_eps", scale, eps, scale)?;
+            rec.sqrt_into("rms_sqrt", scale, scale)?;
+            rec.reciprocal_into("rms_scale", scale, scale)?;
+            rec.mul_into("rms_normalize", scale, x, out)?;
+            if let Some(weight) = weight {
+                rec.mul_into("rms_weight", weight, out, out)?;
+            }
+            Ok(())
+        })
     }
 
-    /// `hb *= silu(hb) * hb2`. Under automatic fusion it is recorded as tensor
-    /// operations in the kernel's order, which fuse into the gate and up projections.
+    /// `hb *= silu(hb) * hb2`, described as tensor operations in the kernel's order
+    /// through `gate`, so it fuses into the gate and up projections.
     fn record_swiglu(
         &self,
         scheme: &mut Scheme,
@@ -241,19 +237,19 @@ impl Blocks {
         hb2: TensorView<'_>,
         gate: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        if !scheme.automatic_fusion() {
-            self.swiglu
-                .record(scheme, "swiglu", hb, hb2)?
-                .over_tensor(&hb);
-            return Ok(());
-        }
-        let mut rec = self.tensors.recorder(scheme);
-        rec.neg_into("silu_neg", hb, gate)?;
-        rec.exp_into("silu_exp", gate, gate)?;
-        rec.add_scalar_into("silu_denominator", gate, 1.0, gate)?;
-        rec.reciprocal_into("silu_reciprocal", gate, gate)?;
-        rec.mul_into("silu", hb, gate, gate)?;
-        rec.mul_into("swiglu", gate, hb2, hb)
+        let node = self
+            .swiglu
+            .record(scheme, "swiglu", hb, hb2)?
+            .over_tensor(&hb)
+            .node();
+        self.tensors.recorder(scheme).describe(node, true, |rec| {
+            rec.neg_into("silu_neg", hb, gate)?;
+            rec.exp_into("silu_exp", gate, gate)?;
+            rec.add_scalar_into("silu_denominator", gate, 1.0, gate)?;
+            rec.reciprocal_into("silu_reciprocal", gate, gate)?;
+            rec.mul_into("silu", hb, gate, gate)?;
+            rec.mul_into("swiglu", gate, hb2, hb)
+        })
     }
 
     /// RMSNorm, Q/K/V, RoPE, attention, output projection, residual into `x`.
@@ -401,7 +397,7 @@ impl Blocks {
         self.tensors
             .recorder(scheme)
             .copy("rms_inplace", tmp.view(), x)?;
-        self.keep(tmp);
+        scheme.keep_alive(tmp);
         Ok(())
     }
 
@@ -426,7 +422,7 @@ impl Blocks {
         self.tensors
             .recorder(scheme)
             .copy("rms_inplace", tmp.view(), x)?;
-        self.keep(tmp);
+        scheme.keep_alive(tmp);
         Ok(())
     }
 
@@ -452,8 +448,8 @@ impl Blocks {
         if let Some(weight) = weight {
             rec.mul_into("rms_weight", weight, out, out)?;
         }
-        self.keep(square);
-        self.keep(scale);
+        scheme.keep_alive(square);
+        scheme.keep_alive(scale);
         Ok(())
     }
 
@@ -548,7 +544,7 @@ impl Blocks {
             .recorder(scheme)
             .tanh_scaled_into("softcap", x, cap, out)?;
         for tensor in kept {
-            self.keep(tensor);
+            scheme.keep_alive(tensor);
         }
         Ok(())
     }
@@ -562,7 +558,7 @@ impl Blocks {
         let mut rec = self.tensors.recorder(scheme);
         let gate = rec.sigmoid("sigmoid_gate", logits)?;
         rec.mul_into("sigmoid_gate_mul", values, gate.view(), values)?;
-        self.keep(gate);
+        scheme.keep_alive(gate);
         Ok(())
     }
 
@@ -586,10 +582,9 @@ impl Blocks {
         let sig = rec.sigmoid("swiglu_sigmoid", gate)?;
         rec.mul_into("swiglu_sig", g.view(), sig.view(), s.view())?;
         rec.mul_into("swiglu", s.view(), u.view(), out)?;
-        self.keep(g);
-        self.keep(u);
-        self.keep(s);
-        self.keep(sig);
+        for tensor in [g, u, s, sig] {
+            scheme.keep_alive(tensor);
+        }
         Ok(())
     }
 
@@ -630,6 +625,8 @@ impl Blocks {
         Ok(())
     }
 
+    /// Causal convolution over the cyclic window `state` at position `step`, as
+    /// tensor operations: the row dot, the skip connection, and the scale.
     pub(crate) fn record_fusable_short_conv_at(
         &self,
         scheme: &mut Scheme,
@@ -639,29 +636,26 @@ impl Blocks {
         step: &Buffer,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        if scheme.automatic_fusion() && scheme.arithmetic_policy() == ArithmeticPolicy::Relaxed {
-            let channels = x.shape().dim(0)?;
-            let kernel = state.shape().dim(1)?;
-            let position = TensorView::new(
-                step,
-                TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
-            )?;
-            let dot = self.vector(channels)?;
-            let summed = self.vector(channels)?;
-            let mut rec = self.tensors.recorder(scheme);
-            rec.cyclic_dot_at("short_conv", x, weight, state, position, dot.view())?;
-            rec.add_into("short_conv_skip", dot.view(), x, summed.view())?;
-            rec.div_scalar_into(
-                "short_conv_scale",
-                summed.view(),
-                ((kernel as f32) + 1.0).sqrt(),
-                out,
-            )?;
-            self.keep(dot);
-            self.keep(summed);
-            return Ok(());
-        }
-        self.record_short_conv_at(scheme, x, weight, state, step, out)
+        let channels = x.shape().dim(0)?;
+        let kernel = state.shape().dim(1)?;
+        let position = TensorView::new(
+            step,
+            TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
+        )?;
+        let dot = self.vector(channels)?;
+        let summed = self.vector(channels)?;
+        let mut rec = self.tensors.recorder(scheme);
+        rec.cyclic_dot_at("short_conv", x, weight, state, position, dot.view())?;
+        rec.add_into("short_conv_skip", dot.view(), x, summed.view())?;
+        rec.div_scalar_into(
+            "short_conv_scale",
+            summed.view(),
+            ((kernel as f32) + 1.0).sqrt(),
+            out,
+        )?;
+        scheme.keep_alive(dot);
+        scheme.keep_alive(summed);
+        Ok(())
     }
 
     pub(crate) fn record_short_conv_at(
@@ -756,14 +750,6 @@ impl Blocks {
             TensorShape::vector(len.max(1)),
             TensorDType::F32,
         )
-    }
-
-    fn keep(&self, tensor: Tensor) {
-        self.algebra.lock().expect("algebra scratch").push(tensor);
-    }
-
-    pub(crate) fn keep_tensor(&self, tensor: Tensor) {
-        self.keep(tensor);
     }
 
     pub(crate) fn runtime(&self) -> &Runtime {
@@ -1011,28 +997,8 @@ mod tests {
 
     use goldy::{Tensor, TensorDType, TensorShape};
 
-    /// Clears `AMMON_SEMANTIC_NORM` on drop, including after a panic.
-    struct SemanticNormFlag;
-
-    impl SemanticNormFlag {
-        fn enable() -> Self {
-            // SAFETY: this lib test is the only writer, and the suite runs one test
-            // at a time (`--test-threads=1`) so nothing else is reading the environment.
-            unsafe { std::env::set_var("AMMON_SEMANTIC_NORM", "1") }
-            Self
-        }
-    }
-
-    impl Drop for SemanticNormFlag {
-        fn drop(&mut self) {
-            // SAFETY: same as `enable` — single-threaded test process.
-            unsafe { std::env::remove_var("AMMON_SEMANTIC_NORM") }
-        }
-    }
-
     #[test]
-    fn semantic_unweighted_rmsnorm_uses_configured_eps() {
-        let _flag = SemanticNormFlag::enable();
+    fn fused_unweighted_rmsnorm_uses_configured_eps() {
         let runtime = crate::gpu::create_runtime().expect("goldy runtime");
         let ctx = runtime.create_context().unwrap();
         let blocks = Blocks::prepare(&runtime).unwrap();
@@ -1072,7 +1038,7 @@ mod tests {
             let tol = 1e-5 + 1e-4 * want.abs();
             assert!(
                 err <= tol,
-                "unweighted semantic [{i}] = {}, reference {want}, err {err}",
+                "unweighted fused [{i}] = {}, reference {want}, err {err}",
                 got[i]
             );
         }

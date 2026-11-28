@@ -1,7 +1,7 @@
 //! Batch-1 decode attention with a ring or a full KV cache.
 //!
-//! Scores match eager Inkling 2 attention: `(Q Kᵀ) * scale + relative bias`,
-//! then a per-head sink logit inside the softmax. The sink has no value. A
+//! Scores are `(Q Kᵀ) * scale + relative bias`, then a per-head sink logit inside
+//! the softmax. The sink has no value. A
 //! sliding layer attends `window` keys (distances `0 .. window-1`); a full
 //! layer attends every key at `0 ..= position`, and a distance past
 //! `rel_extent` adds zero bias. Head size is at most 128, the same cap as the
