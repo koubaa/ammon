@@ -287,9 +287,13 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     .count()
             })
             .sum();
+        // Metal cannot realize the reduction order of the native projection that
+        // feeds an unscaled relative clip, so that clip stays a dispatch of its own.
+        let metal = device.backend_type() == goldy::BackendType::Metal;
         let expected = match (relaxed, logged) {
             (false, _) => 0,
             (true, true) => 1,
+            (true, false) if metal => 2,
             (true, false) => 3,
         };
         assert_eq!(clips, expected, "fused clips: {report:?}");
