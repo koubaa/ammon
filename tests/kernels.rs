@@ -653,9 +653,9 @@ fn rmsnorm_matches_cpu_reference_for_eps_and_width() {
     let unweighted_ip = RmsnormUnweightedInplaceKernel::prepare(&device).unwrap();
     // 0.1 is comparable to mean(x²) of these inputs, so ignoring eps fails the
     // tolerance. 1e-6 versus the 1e-5 default does not.
-    let module = RmsNorm::with_eps(&device, 0.1).unwrap();
+    let module = RmsNorm::with_eps(&device, 8, 0.1).unwrap();
     assert_eq!(module.eps(), 0.1);
-    assert_eq!(RmsNorm::new(&device).unwrap().eps(), DEFAULT_RMS_EPS);
+    assert_eq!(RmsNorm::new(&device, 8).unwrap().eps(), DEFAULT_RMS_EPS);
 
     for (dim, seed, eps) in [
         (1u32, 4u32, DEFAULT_RMS_EPS),

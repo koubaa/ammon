@@ -7,7 +7,7 @@ Ammon is not a training framework and not a specific model. It sits between Gold
 ## What it owns
 
 - GPU kernels: embedding, RMSNorm, RoPE, attention, SwiGLU, pos-strided cache GEMV, per-head L2 clip, softcap, sigmoid gate, softcapped SwiGLU, one-token causal depthwise convolution, ring or full KV cache, relative-bias decode attention, routed experts (top-k on device), depth mix over the block tape
-- Recordable modules that own decode scratch where needed (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`, `ShortConv`, `DynamicShortConv`, `DecodeAttention`, `DecodeLayerState`, `DecodeMoe`, `DepthRunner`) and kernel-only modules (`Embedding`, `RmsNorm`, `Linear`, `HeadL2Clip`, `Softcap`, `SigmoidGate`, `SoftcappedSwiGlu`)
+- Recordable modules that own the scratch their dispatches bind (`CausalAttentionBlock`, `SwiGluBlock`, `KvCache`, `RmsNorm`, `Softcap`, `SigmoidGate`, `SoftcappedSwiGlu`, `ShortConv`, `DynamicShortConv`, `DecodeAttention`, `DecodeLayerState`, `DecodeMoe`, `DepthRunner`) and kernel-only modules (`Embedding`, `Linear`, `HeadL2Clip`, `DepthMix`)
 - Weight view structs (`CausalAttentionBlockWeights`, `SwiGluBlockWeights`); packed checkpoints stay in architecture crates
 - Prepared kernels cached per Goldy runtime (not part of the architecture-crate API)
 - Re-exported Goldy tensor kernels: residual `add` and semantic `matmul` (`TensorKernels`)
@@ -29,11 +29,13 @@ scheme with `ammon::configure_inference_scheme(&mut scheme)` to select Goldy's r
 generated-kernel and fusion variants. Validation or reproducibility checks can leave the
 default `ArithmeticPolicy::MatchRecorded` in place.
 
-`RmsnormKernel::record` and `RmsnormInplaceKernel::record` take a trailing `eps: f32`. That is a source break for anyone calling those kernels directly. `RmsNorm::new`, `RmsNorm::record`, `RmsNorm::record_inplace`, and the pre-norm block `new` constructors are unchanged and still use `DEFAULT_RMS_EPS` (`1e-5`). Pass another epsilon with `with_eps`.
+`RmsnormKernel::record` and `RmsnormInplaceKernel::record` take a trailing `eps: f32`. That is a source break for anyone calling those kernels directly. `RmsNorm::new` and the pre-norm block `new` constructors use `DEFAULT_RMS_EPS` (`1e-5`). Pass another epsilon with `with_eps`.
+
+A module owns every buffer its recorded dispatches bind, allocated once when it is built, and must outlive the schemes it records into. Schemes do not keep scratch alive: dropping a module and submitting a scheme it recorded into fails with `StaleResource`. Modules whose scratch depends on the input width take it at construction: `RmsNorm::new(runtime, dim)`, `RmsNorm::with_eps(runtime, dim, eps)`, `Softcap::new(runtime, len, cap)`, `SigmoidGate::new(runtime, len)`, and `SoftcappedSwiGlu::new(runtime, len, gate_cap, up_cap)`. Each record on one module binds the same scratch, so give sites that should not share it their own module.
 
 ## CI goldy pin
 
-`.github/workflows/ci.yml` sets `GOLDY_REF` to goldy `main`. Ammon depends on Goldy by path (`../goldy`), so CI checks that branch out beside this repo. `goldy::gpu::tanh` and `goldy::gpu::sigmoid` still use the odd Taylor series through `x^11` for `|x| < 0.5`.
+`.github/workflows/ci.yml` sets `GOLDY_REF` to goldy `main`, or to a dependency branch while a goldy pull request is open. Ammon depends on Goldy by path (`../goldy`), so CI checks that branch out beside this repo. `goldy::gpu::tanh` and `goldy::gpu::sigmoid` still use the odd Taylor series through `x^11` for `|x| < 0.5`.
 
 ## Tests
 

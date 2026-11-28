@@ -21,12 +21,14 @@ use crate::kernels::{
 use crate::moe::MoeTopkKernel;
 use anyhow::Context;
 use goldy::{
-    Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorLayout, TensorScalar,
-    TensorShape, TensorView,
+    Buffer, GoldyError, Runtime, Scheme, TensorDType, TensorLayout, TensorScalar, TensorShape,
+    TensorView,
 };
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Prepared kernels for one runtime. Used while recording; schemes intern the pipelines.
+///
+/// Holds no scratch. The module that records a dispatch owns the buffers it binds.
 pub(crate) struct Blocks {
     embed: EmbedKernel,
     rmsnorm: RmsnormKernel,
@@ -45,7 +47,6 @@ pub(crate) struct Blocks {
     softcapped_swiglu: SoftcappedSwiGluKernel,
     short_conv: ShortConvKernel,
     dynamic_short_conv: DynamicShortConvKernel,
-    runtime: Runtime,
     kv_cache_store: KvCacheStoreKernel,
     /// Serial reference. The recorded path is the split-K pair.
     #[allow(dead_code)]
@@ -104,6 +105,52 @@ pub(crate) struct NormScratch<'a> {
     pub scale: TensorView<'a>,
 }
 
+/// Intermediates of `cap * tanh(x / cap)` for `cap != 1`: the quotient and its
+/// tanh, each the shape of `x`.
+#[derive(Clone, Copy)]
+pub(crate) struct SoftcapScratch<'a> {
+    pub scaled: TensorView<'a>,
+    pub curved: TensorView<'a>,
+}
+
+/// Intermediates of a softcapped SwiGLU, each the shape of the gate. A softcap
+/// with a unit cap needs no scratch.
+#[derive(Clone, Copy)]
+pub(crate) struct SwiGluScratch<'a> {
+    pub gate_cap: Option<SoftcapScratch<'a>>,
+    pub up_cap: Option<SoftcapScratch<'a>>,
+    pub gate: TensorView<'a>,
+    pub up: TensorView<'a>,
+    pub sigmoid: TensorView<'a>,
+    pub gated: TensorView<'a>,
+}
+
+/// The row dot and the skip sum of a causal convolution, each `[channels]`.
+#[derive(Clone, Copy)]
+pub(crate) struct ConvScratch<'a> {
+    pub dot: TensorView<'a>,
+    pub summed: TensorView<'a>,
+}
+
+/// Scratch of a dynamic causal convolution over `[heads, head_dim]` rows: the
+/// summed weights, `[kernel, heads, head_dim]`, then the row dot and the skip
+/// sum, each `[heads, head_dim]`.
+#[derive(Clone, Copy)]
+pub(crate) struct DynamicConvScratch<'a> {
+    pub weight: TensorView<'a>,
+    pub dot: TensorView<'a>,
+    pub summed: TensorView<'a>,
+}
+
+/// Scratch of a per-head L2 clip described as tensor operations: the scaled
+/// input and its squares, each `[heads, dim]`, and the clip factor, `[heads, 1]`.
+#[derive(Clone, Copy)]
+pub(crate) struct ClipScratch<'a> {
+    pub scaled: TensorView<'a>,
+    pub square: TensorView<'a>,
+    pub factor: TensorView<'a>,
+}
+
 impl Blocks {
     pub(crate) fn shared(runtime: &Runtime) -> anyhow::Result<Arc<Self>> {
         let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -149,7 +196,6 @@ impl Blocks {
             short_conv: ShortConvKernel::prepare(runtime).context("prepare short_conv kernel")?,
             dynamic_short_conv: DynamicShortConvKernel::prepare(runtime)
                 .context("prepare dynamic_short_conv kernel")?,
-            runtime: runtime.clone(),
             kv_cache_store: KvCacheStoreKernel::prepare(runtime)
                 .context("prepare kv_cache_store kernel")?,
             relative_attention: RelativeAttentionKernel::prepare(runtime)
@@ -368,83 +414,43 @@ impl Blocks {
         Ok(())
     }
 
-    pub(crate) fn record_rmsnorm(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        weight: TensorView<'_>,
-        out: TensorView<'_>,
-        eps: f32,
-    ) -> Result<(), GoldyError> {
-        self.record_rms_algebra(scheme, x, Some(weight), out, eps)
-    }
-
-    pub(crate) fn record_rmsnorm_inplace(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        weight: TensorView<'_>,
-        eps: f32,
-    ) -> Result<(), GoldyError> {
-        let tmp = self.vector(x.numel_u32())?;
-        self.record_rms_algebra(scheme, x, Some(weight), tmp.view(), eps)?;
-        self.tensors
-            .recorder(scheme)
-            .copy("rms_inplace", tmp.view(), x)?;
-        scheme.keep_alive(tmp);
-        Ok(())
-    }
-
-    pub(crate) fn record_rmsnorm_unweighted(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        out: TensorView<'_>,
-        eps: f32,
-    ) -> Result<(), GoldyError> {
-        self.record_rms_algebra(scheme, x, None, out, eps)
-    }
-
-    pub(crate) fn record_rmsnorm_unweighted_inplace(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        eps: f32,
-    ) -> Result<(), GoldyError> {
-        let tmp = self.vector(x.numel_u32())?;
-        self.record_rms_algebra(scheme, x, None, tmp.view(), eps)?;
-        self.tensors
-            .recorder(scheme)
-            .copy("rms_inplace", tmp.view(), x)?;
-        scheme.keep_alive(tmp);
-        Ok(())
-    }
-
     /// `out = x * rsqrt(mean(x²) + eps) * weight`. Tensor algebra, so fusion can
     /// see it. `weight` is `None` for the unweighted form.
-    fn record_rms_algebra(
+    pub(crate) fn record_rmsnorm(
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
         weight: Option<TensorView<'_>>,
         out: TensorView<'_>,
+        scratch: NormScratch<'_>,
         eps: f32,
     ) -> Result<(), GoldyError> {
-        let square = self.vector(x.numel_u32())?;
-        let scale = self.vector(1)?;
+        let NormScratch { square, scale } = scratch;
         let mut rec = self.tensors.recorder(scheme);
-        rec.mul_into("rms_square", x, x, square.view())?;
-        rec.mean_into("rms_mean", square.view(), 0, scale.view())?;
-        rec.add_scalar_into("rms_eps", scale.view(), eps, scale.view())?;
-        rec.sqrt_into("rms_sqrt", scale.view(), scale.view())?;
-        rec.reciprocal_into("rms_scale", scale.view(), scale.view())?;
-        rec.mul_into("rms_normalize", scale.view(), x, out)?;
+        rec.mul_into("rms_square", x, x, square)?;
+        rec.mean_into("rms_mean", square, 0, scale)?;
+        rec.add_scalar_into("rms_eps", scale, eps, scale)?;
+        rec.sqrt_into("rms_sqrt", scale, scale)?;
+        rec.reciprocal_into("rms_scale", scale, scale)?;
+        rec.mul_into("rms_normalize", scale, x, out)?;
         if let Some(weight) = weight {
             rec.mul_into("rms_weight", weight, out, out)?;
         }
-        scheme.keep_alive(square);
-        scheme.keep_alive(scale);
         Ok(())
+    }
+
+    /// [`Self::record_rmsnorm`] into `tmp`, then copied back over `x`.
+    pub(crate) fn record_rmsnorm_inplace(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: Option<TensorView<'_>>,
+        scratch: NormScratch<'_>,
+        tmp: TensorView<'_>,
+        eps: f32,
+    ) -> Result<(), GoldyError> {
+        self.record_rmsnorm(scheme, x, weight, tmp, scratch, eps)?;
+        self.tensors.recorder(scheme).copy("rms_inplace", tmp, x)
     }
 
     pub(crate) fn record_linear(
@@ -510,6 +516,7 @@ impl Blocks {
         alpha: f32,
         floor: f32,
         use_scale: u32,
+        scratch: Option<ClipScratch<'_>>,
     ) -> Result<(), GoldyError> {
         let heads = x.shape().dim(0)?;
         if heads == 0 {
@@ -528,68 +535,70 @@ impl Blocks {
         if alpha != 0.0 {
             return Ok(());
         }
-        let scaled = Tensor::zeros(&self.runtime, x.shape(), TensorDType::F32)?;
-        let square = Tensor::zeros(&self.runtime, x.shape(), TensorDType::F32)?;
-        let factor = Tensor::zeros(
-            &self.runtime,
-            TensorShape::matrix(heads, 1),
-            TensorDType::F32,
-        )?;
+        let ClipScratch {
+            scaled,
+            square,
+            factor: f,
+        } = scratch.ok_or_else(|| {
+            GoldyError::Validation("l2 clip: a clip without a log scale needs scratch".into())
+        })?;
         // The kernel sums each head across 256 lanes, so the sequential sum is not its order.
         self.tensors.recorder(scheme).describe(node, false, |rec| {
             let y = if use_scale != 0 {
-                rec.mul_into("l2_scale", x, scale, scaled.view())?;
-                scaled.view()
+                rec.mul_into("l2_scale", x, scale, scaled)?;
+                scaled
             } else {
                 x
             };
-            let f = factor.view();
-            rec.mul_into("l2_square", y, y, square.view())?;
-            rec.sum_into("l2_sum", square.view(), 1, f)?;
+            rec.mul_into("l2_square", y, y, square)?;
+            rec.sum_into("l2_sum", square, 1, f)?;
             rec.sqrt_into("l2_norm", f, f)?;
             rec.add_scalar_into("l2_eps", f, crate::decode_ops::L2_CLIP_NORM_EPS, f)?;
             rec.reciprocal_into("l2_inverse", f, f)?;
             rec.mul_scalar_into("l2_ratio", f, threshold, f)?;
             rec.min_scalar_into("l2_factor", f, 1.0, f)?;
             rec.mul_into("l2_clip", y, f, out)
-        })?;
-        for scratch in [scaled, square, factor] {
-            scheme.keep_alive(scratch);
-        }
-        Ok(())
+        })
     }
 
+    /// `out = cap * tanh(x / cap)`. A unit cap is one tanh and takes no scratch;
+    /// any other cap divides, takes the tanh, and multiplies through `scratch`.
     pub(crate) fn record_softcap(
         &self,
         scheme: &mut Scheme,
         x: TensorView<'_>,
         out: TensorView<'_>,
         cap: f32,
+        scratch: Option<SoftcapScratch<'_>>,
     ) -> Result<(), GoldyError> {
-        // `cap == 1` is one tanh. Goldy owns that identity.
-        let kept = self
-            .tensors
-            .recorder(scheme)
-            .tanh_scaled_into("softcap", x, cap, out)?;
-        for tensor in kept {
-            scheme.keep_alive(tensor);
+        let mut rec = self.tensors.recorder(scheme);
+        if cap == 1.0 {
+            return rec.tanh_into("softcap", x, out);
         }
-        Ok(())
+        let SoftcapScratch { scaled, curved } = scratch.ok_or_else(|| {
+            GoldyError::Validation(format!(
+                "softcap: cap {cap} needs quotient and tanh scratch"
+            ))
+        })?;
+        rec.div_scalar_into("softcap_div", x, cap, scaled)?;
+        rec.tanh_into("softcap_tanh", scaled, curved)?;
+        rec.mul_scalar_into("softcap", curved, cap, out)
     }
 
+    /// `values *= sigmoid(logits)`, with the sigmoid stored in `gate`.
     pub(crate) fn record_sigmoid_gate(
         &self,
         scheme: &mut Scheme,
         values: TensorView<'_>,
         logits: TensorView<'_>,
+        gate: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         let mut rec = self.tensors.recorder(scheme);
-        let gate = rec.sigmoid("sigmoid_gate", logits)?;
-        rec.mul_into("sigmoid_gate_mul", values, gate.view(), values)?;
-        scheme.keep_alive(gate);
-        Ok(())
+        rec.sigmoid_into("sigmoid_gate", logits, gate)?;
+        rec.mul_into("sigmoid_gate_mul", values, gate, values)
     }
 
+    /// Scratch has the gate's shape, so a `[slots, cols]` gate stays one op each.
     pub(crate) fn record_softcapped_swiglu(
         &self,
         scheme: &mut Scheme,
@@ -598,22 +607,14 @@ impl Blocks {
         out: TensorView<'_>,
         gate_cap: f32,
         up_cap: f32,
+        scratch: SwiGluScratch<'_>,
     ) -> Result<(), GoldyError> {
-        // Scratch takes the gate's shape, so a `[slots, cols]` gate stays one op each.
-        let scratch = || Tensor::zeros(&self.runtime, gate.shape(), TensorDType::F32);
-        let g = scratch()?;
-        let u = scratch()?;
-        let s = scratch()?;
-        self.record_softcap(scheme, gate, g.view(), gate_cap)?;
-        self.record_softcap(scheme, up, u.view(), up_cap)?;
+        self.record_softcap(scheme, gate, scratch.gate, gate_cap, scratch.gate_cap)?;
+        self.record_softcap(scheme, up, scratch.up, up_cap, scratch.up_cap)?;
         let mut rec = self.tensors.recorder(scheme);
-        let sig = rec.sigmoid("swiglu_sigmoid", gate)?;
-        rec.mul_into("swiglu_sig", g.view(), sig.view(), s.view())?;
-        rec.mul_into("swiglu", s.view(), u.view(), out)?;
-        for tensor in [g, u, s, sig] {
-            scheme.keep_alive(tensor);
-        }
-        Ok(())
+        rec.sigmoid_into("swiglu_sigmoid", gate, scratch.sigmoid)?;
+        rec.mul_into("swiglu_sig", scratch.gate, scratch.sigmoid, scratch.gated)?;
+        rec.mul_into("swiglu", scratch.gated, scratch.up, out)
     }
 
     pub(crate) fn record_short_conv(
@@ -663,27 +664,23 @@ impl Blocks {
         state: TensorView<'_>,
         step: &Buffer,
         out: TensorView<'_>,
+        scratch: ConvScratch<'_>,
     ) -> Result<(), GoldyError> {
-        let channels = x.shape().dim(0)?;
         let kernel = state.shape().dim(1)?;
         let position = TensorView::new(
             step,
             TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
         )?;
-        let dot = self.vector(channels)?;
-        let summed = self.vector(channels)?;
+        let ConvScratch { dot, summed } = scratch;
         let mut rec = self.tensors.recorder(scheme);
-        rec.cyclic_dot_at("short_conv", x, weight, state, position, dot.view())?;
-        rec.add_into("short_conv_skip", dot.view(), x, summed.view())?;
+        rec.cyclic_dot_at("short_conv", x, weight, state, position, dot)?;
+        rec.add_into("short_conv_skip", dot, x, summed)?;
         rec.div_scalar_into(
             "short_conv_scale",
-            summed.view(),
+            summed,
             ((kernel as f32) + 1.0).sqrt(),
             out,
-        )?;
-        scheme.keep_alive(dot);
-        scheme.keep_alive(summed);
-        Ok(())
+        )
     }
 
     /// Dynamic causal convolution over the cyclic window `state` at position `step`,
@@ -699,6 +696,7 @@ impl Blocks {
         state: TensorView<'_>,
         step: &Buffer,
         out: TensorView<'_>,
+        scratch: DynamicConvScratch<'_>,
     ) -> Result<(), GoldyError> {
         let channels = x.shape().dim(0)?;
         let kernel = state.shape().dim(1)?;
@@ -717,47 +715,44 @@ impl Blocks {
             step,
             TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
         )?;
-        // Tap-major, so each tap's sum is one contiguous block.
-        let weight = Tensor::zeros(
-            &self.runtime,
-            TensorShape::from_dims(&[kernel, heads, head_dim])?,
-            TensorDType::F32,
-        )?;
         let rows = [heads, head_dim];
-        let row_shape = TensorShape::from_dims(&rows)?;
-        let dot = Tensor::zeros(&self.runtime, row_shape, TensorDType::F32)?;
-        let summed = Tensor::zeros(&self.runtime, row_shape, TensorDType::F32)?;
+        let DynamicConvScratch {
+            weight,
+            dot,
+            summed,
+        } = scratch;
+        // Tap-major, so each tap's sum is one contiguous block.
+        if weight.shape().dims() != [kernel, heads, head_dim]
+            || dot.shape().dims() != rows
+            || summed.shape().dims() != rows
+        {
+            return Err(GoldyError::Validation(
+                "dynamic conv: scratch is [kernel, heads, head_dim] weights and [heads, head_dim] rows"
+                    .into(),
+            ));
+        }
         let x = x.reshape(&rows)?;
         let state = state.reshape(&[heads, head_dim, kernel])?;
         let out = out.reshape(&rows)?;
         let mut rec = self.tensors.recorder(scheme);
         rec.cyclic_store_at("short_conv_store", x, state, position)?;
         for lag in 0..kernel {
-            let column = weight
-                .view()
-                .narrow(0, kernel - 1 - lag, 1)?
-                .reshape(&rows)?;
+            let column = weight.narrow(0, kernel - 1 - lag, 1)?.reshape(&rows)?;
             let fixed = static_weight.narrow(0, lag, 1)?.reshape(&rows)?;
             let tap = taps.narrow(1, lag, 1)?;
             rec.add_into("short_conv_weight", fixed, tap, column)?;
         }
-        let window = weight.view().permute(&[1, 2, 0])?;
-        rec.cyclic_window_dot_at("short_conv_dot", window, state, position, dot.view())?;
-        rec.add_into("short_conv_skip", dot.view(), x, summed.view())?;
+        let window = weight.permute(&[1, 2, 0])?;
+        rec.cyclic_window_dot_at("short_conv_dot", window, state, position, dot)?;
+        rec.add_into("short_conv_skip", dot, x, summed)?;
         rec.div_scalar_into(
             "short_conv_scale",
-            summed.view(),
+            summed,
             (2.0 * (kernel as f32) + 1.0).sqrt(),
             out,
-        )?;
-        for scratch in [weight, dot, summed] {
-            scheme.keep_alive(scratch);
-        }
-        Ok(())
+        )
     }
 
-    /// `out = weight[ids[slot]] @ x`. The returned slab must stay alive; it is
-    /// retained on this `Blocks`.
     pub(crate) fn record_add(
         &self,
         scheme: &mut Scheme,
@@ -769,6 +764,7 @@ impl Blocks {
         self.tensors.add_into(scheme, label, a, b, out)
     }
 
+    /// `out = weight[ids[slot]] @ x`. The slab is read in place.
     pub(crate) fn record_indexed_matmul(
         &self,
         scheme: &mut Scheme,
@@ -800,18 +796,6 @@ impl Blocks {
         self.tensors
             .recorder(scheme)
             .matmul_indexed_batch_into(label, weight, x, ids, slot, count, x_stride, out)
-    }
-
-    fn vector(&self, len: u32) -> Result<Tensor, GoldyError> {
-        Tensor::zeros(
-            &self.runtime,
-            TensorShape::vector(len.max(1)),
-            TensorDType::F32,
-        )
-    }
-
-    pub(crate) fn runtime(&self) -> &Runtime {
-        &self.runtime
     }
 
     pub(crate) fn tensor_recorder<'a>(
