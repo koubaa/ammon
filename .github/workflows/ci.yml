@@ -97,6 +97,7 @@ jobs:
         arithmetic: [match-recorded, relaxed]
     env:
       AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
+      GOLDY_MATMUL_GEMV: library
       MTL_DEBUG_LAYER: "1"
       MTL_SHADER_VALIDATION: "1"
     steps:
