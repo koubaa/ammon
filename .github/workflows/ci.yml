@@ -4,8 +4,7 @@
 # as siblings. GPU tests are not optional: the job fails if lavapipe is missing
 # or does not advertise Vulkan 1.4.
 #
-# GOLDY_REF is the goldy checkout. While koubaa/goldy#360 is open it pins that
-# branch, which adds the max_reduce_into the combine's description records.
+# GOLDY_REF is the goldy checkout: main at the merge of koubaa/goldy#364.
 # Indexed GEMV reads the slab in place, and a unit softcap is one tanh
 # inside goldy. Retained command buffers keep their own frame-table rows.
 
@@ -20,7 +19,7 @@ on:
     types: [goldy_main]
 
 env:
-  GOLDY_REF: cursor/reduce-into-forms-06c6
+  GOLDY_REF: de00d6100f136ae48b01f6a91c30b8153f3ad800
 
 jobs:
   test:
@@ -86,3 +85,80 @@ jobs:
       - name: Vulkan tests
         working-directory: ammon
         run: cargo test --features vulkan -- --test-threads=1
+
+  metal:
+    name: Metal (${{ matrix.arithmetic }})
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arithmetic: [match-recorded, relaxed]
+    env:
+      AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
+      MTL_DEBUG_LAYER: "1"
+      MTL_SHADER_VALIDATION: "1"
+    steps:
+      - name: Checkout ammon
+        uses: actions/checkout@v4
+        with:
+          path: ammon
+
+      - name: Checkout goldy
+        uses: actions/checkout@v4
+        with:
+          repository: koubaa/goldy
+          ref: ${{ env.GOLDY_REF }}
+          path: goldy
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download Slang compiler
+        working-directory: goldy/slang
+        run: |
+          set -euo pipefail
+          chmod +x download.sh
+          ./download.sh
+          if [ "$(uname -m)" = "arm64" ]; then
+            SLANG_DIR="$(pwd)/bin/macos-aarch64"
+          else
+            SLANG_DIR="$(pwd)/bin/macos-x86_64"
+          fi
+          echo "GOLDY_SLANG_PATH=$SLANG_DIR/libslang.dylib" >> "$GITHUB_ENV"
+          echo "SLANG_LIB_DIR=$SLANG_DIR" >> "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ammon/target
+          key: ${{ runner.os }}-cargo-metal-${{ hashFiles('ammon/Cargo.lock', 'goldy/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-metal-
+
+      - name: Metal tests
+        working-directory: ammon
+        env:
+          DYLD_LIBRARY_PATH: ${{ env.SLANG_LIB_DIR }}
+        run: |
+          set -euo pipefail
+          cargo test --features metal --lib \
+            --test fused_blocks \
+            --test inkling_attention \
+            --test kernels \
+            --test moe \
+            --test packed \
+            --test scratch_lifetime \
+            -- --test-threads=1
+          # The model path uses position-addressed algebra. Keep the legacy
+          # stateful dynamic-convolution cases on lavapipe until Metal can
+          # synchronize MPS writes consumed by a generated kernel in one graph.
+          cargo test --features metal --test decode_ops -- \
+            --test-threads=1 \
+            --skip dynamic_short_conv_matches_cpu_reference_and_resets \
+            --skip matches_pinned_transformers_modules \
+            --skip wide_clip_and_conv_match_reference

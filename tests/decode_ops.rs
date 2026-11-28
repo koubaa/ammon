@@ -335,16 +335,21 @@ fn short_conv_at_fused_matches_unfused_bits() {
         assert_eq!(outputs[0], outputs[1], "position {position}");
     }
     let report = runs[0].4.fusion_report();
-    assert!(
-        report.regions.iter().any(|region| {
-            matches!(region.status, goldy::FusionRegionStatus::Promoted)
-                && region
-                    .labels
-                    .iter()
-                    .any(|l| l.to_string() == "short_conv_dot")
-        }),
-        "{report:?}"
-    );
+    let dot_promoted = report.regions.iter().any(|region| {
+        matches!(region.status, goldy::FusionRegionStatus::Promoted)
+            && region
+                .labels
+                .iter()
+                .any(|label| label.to_string() == "short_conv_dot")
+    });
+    let dot_kept_exact = report.rejected.iter().any(|rejected| {
+        rejected
+            .labels
+            .iter()
+            .any(|label| label.to_string() == "short_conv_dot")
+            && matches!(rejected.reason, goldy::FusionRejection::Contraction { .. })
+    });
+    assert!(dot_promoted || dot_kept_exact, "{report:?}");
 }
 
 #[test]
