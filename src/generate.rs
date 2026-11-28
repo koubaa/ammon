@@ -58,10 +58,11 @@ pub fn generate_tokens<M: AutoregressiveModel>(
     let mut start = None;
 
     while pos < max_new_tokens.saturating_sub(1) {
-        let logits = model.step(token, pos)?;
         let next = if (pos as usize) < prompt_tokens.len() - 1 {
+            model.advance(token, pos)?;
             prompt_tokens[pos as usize + 1]
         } else {
+            let logits = model.step_view(token, pos)?;
             sample_argmax(&logits)
         };
         pos += 1;
@@ -129,7 +130,9 @@ fn logit_margin(logits: &[f32]) -> f32 {
 
 /// Teacher-force `prompt`, then append `max_new` greedy tokens.
 ///
-/// `step` returns owned logits, so the next step can write the device buffer.
+/// Non-final prompt tokens use [`AutoregressiveModel::advance`] so prefill does
+/// not stall on host logit readbacks; decode steps read [`AutoregressiveModel::step_view`]
+/// in place and release the view before submitting the next token.
 pub fn greedy_decode<M: AutoregressiveModel>(
     model: &mut M,
     prompt: &[u32],
@@ -138,33 +141,37 @@ pub fn greedy_decode<M: AutoregressiveModel>(
     anyhow::ensure!(!prompt.is_empty(), "greedy decode needs a prompt token");
     let mut step_secs = Vec::with_capacity(prompt.len() + max_new as usize);
     let started = Instant::now();
-    let step_started = Instant::now();
-    let mut logits = model.step(prompt[0], 0)?;
-    step_secs.push(step_started.elapsed().as_secs_f64());
-    for (index, token) in prompt.iter().enumerate().skip(1) {
+    let last_prompt = prompt.len() - 1;
+    for (index, &token) in prompt[..last_prompt].iter().enumerate() {
         let step_started = Instant::now();
-        logits = model.step(*token, index as u32)?;
+        model.advance(token, index as u32)?;
         step_secs.push(step_started.elapsed().as_secs_f64());
     }
+    let step_started = Instant::now();
+    let logits = model.step_view(prompt[last_prompt], last_prompt as u32)?;
+    step_secs.push(step_started.elapsed().as_secs_f64());
     let prefill_secs = started.elapsed().as_secs_f64();
-    let last_logits = logits.clone();
+    let last_logits = logits.to_vec();
+
+    let mut logits = Some(logits);
     let mut new_tokens = Vec::with_capacity(max_new as usize);
     let mut margins = Vec::with_capacity(max_new as usize);
-    let mut pos = prompt.len() as u32;
     let decode_started = Instant::now();
     let mut decode_steps = 0u32;
-    for step in 0..max_new {
-        let next = sample_argmax(&logits);
-        margins.push(logit_margin(&logits));
+    for (pos, step) in (prompt.len() as u32..).zip(0..max_new) {
+        let view = logits.take().expect("logits");
+        let next = sample_argmax(&view);
+        margins.push(logit_margin(&view));
+        // Release the active HostSink claim before submitting the next token.
+        drop(view);
         anyhow::ensure!(next >= 0, "argmax returned {next}");
         new_tokens.push(next as u32);
         if step + 1 == max_new {
             break;
         }
         let step_started = Instant::now();
-        logits = model.step(next as u32, pos)?;
+        logits = Some(model.step_view(next as u32, pos)?);
         step_secs.push(step_started.elapsed().as_secs_f64());
-        pos += 1;
         decode_steps += 1;
     }
     Ok(GreedyReport {
@@ -203,4 +210,56 @@ pub fn generate<M: AutoregressiveModel, T: Tokenizer>(
         prompt_tokens: out.prompt_tokens,
         tokens_per_second: out.tokens_per_second,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LogitsView;
+
+    struct MockModel {
+        advances: Vec<(u32, u32)>,
+        steps: Vec<(u32, u32)>,
+    }
+
+    impl AutoregressiveModel for MockModel {
+        fn vocab_size(&self) -> usize {
+            4
+        }
+
+        fn max_seq_len(&self) -> u32 {
+            16
+        }
+
+        fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
+            self.steps.push((token, pos));
+            let mut v = vec![0.0; 4];
+            v[((token + pos + 1) % 4) as usize] = 5.0;
+            Ok(v)
+        }
+
+        fn step_view(&mut self, token: u32, pos: u32) -> Result<LogitsView> {
+            Ok(LogitsView::Owned(self.step(token, pos)?))
+        }
+
+        fn advance(&mut self, token: u32, pos: u32) -> Result<()> {
+            self.advances.push((token, pos));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn greedy_decode_uses_advance_for_non_final_prompt_tokens() {
+        let mut model = MockModel {
+            advances: Vec::new(),
+            steps: Vec::new(),
+        };
+        let report = greedy_decode(&mut model, &[1, 2, 3], 3).unwrap();
+        assert_eq!(model.advances, vec![(1, 0), (2, 1)]);
+        assert_eq!(model.steps.len(), 3);
+        assert_eq!(model.steps[0], (3, 2));
+        assert_eq!(report.new_tokens.len(), 3);
+        assert_eq!(report.decode_steps, 2);
+        assert_eq!(report.margins, vec![5.0, 5.0, 5.0]);
+    }
 }

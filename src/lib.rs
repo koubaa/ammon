@@ -100,15 +100,15 @@ mod moe;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 pub use modules::{
     CausalAttentionBlock, CausalAttentionBlockWeights, DecodeAttention, DecodeAttentionKind,
-    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeMoe, DepthMix, DynamicShortConv,
-    Embedding, ExpertWeight, HeadL2Clip, KvCache, KvLayer, Linear, LogPositionScale, PackedExperts,
-    RmsNorm, RouterWeight, ShortConv, SigmoidGate, Softcap, SoftcappedSwiGlu, SwiGluBlock,
-    SwiGluBlockWeights, DEFAULT_RMS_EPS,
+    DecodeAttentionWeights, DecodeKvCache, DecodeLayerState, DecodeLayerStateSpec, DecodeMoe,
+    DepthMix, DynamicShortConv, Embedding, ExpertWeight, HeadL2Clip, KvCache, KvLayer, Linear,
+    LogPositionScale, PackedExperts, RmsNorm, RouterWeight, ShortConv, SigmoidGate, Softcap,
+    SoftcappedSwiGlu, SwiGluBlock, SwiGluBlockWeights, DEFAULT_RMS_EPS, DEPTH_RMS_EPS,
 };
 
 pub use generate::{
     generate, generate_tokens, greedy_decode, GenerateOptions, GenerateOutput, GenerateTokenOutput,
     GreedyReport,
 };
-pub use model::AutoregressiveModel;
+pub use model::{AutoregressiveModel, LogitsView};
 pub use tokenizer::{sample_argmax, BpeTokenizer, Tokenizer};
