@@ -46,9 +46,11 @@ fn vector(device: &Runtime, values: &[f32]) -> Tensor {
 fn head_l2_clip_matches_cpu_reference() {
     let device = runtime();
     let ctx = device.create_context().unwrap();
-    let plain = HeadL2Clip::new(&device, 2.0).unwrap();
+    let plain = HeadL2Clip::new(&device, 2, 2, 2.0).unwrap();
     let logged = HeadL2Clip::with_log_scale(
         &device,
+        2,
+        2,
         2.0,
         LogPositionScale {
             alpha: 0.5,
@@ -124,7 +126,7 @@ fn softcap_and_sigmoid_gate_match_cpu_reference() {
         TensorDType::F32,
     )
     .unwrap();
-    let cap = Softcap::new(&device, 4.0).unwrap();
+    let cap = Softcap::new(&device, x_host.len() as u32, 4.0).unwrap();
     let mut scheme = Scheme::new(&ctx);
     cap.record(&mut scheme, x.view(), out.view()).unwrap();
     let want = cpu_ref::softcap(&x_host, 4.0);
@@ -144,7 +146,7 @@ fn softcap_and_sigmoid_gate_match_cpu_reference() {
         let x_host: Vec<f32> = (0..1001).map(|i| (i as f32 / 1000.0) * 0.6 - 0.3).collect();
         let x = vector(&device, &x_host);
         let out = Tensor::zeros(&device, TensorShape::vector(1001), TensorDType::F32).unwrap();
-        let op = Softcap::new(&device, cap as f32).unwrap();
+        let op = Softcap::new(&device, 1001, cap as f32).unwrap();
         let mut scheme = Scheme::new(&ctx);
         op.record(&mut scheme, x.view(), out.view()).unwrap();
         let want = cpu_ref::softcap(&x_host, cap);
@@ -161,7 +163,7 @@ fn softcap_and_sigmoid_gate_match_cpu_reference() {
     let logits_host = [0.0_f32, 20.0, -20.0, 1.0];
     let values = vector(&device, &values_host);
     let logits = vector(&device, &logits_host);
-    let gate = SigmoidGate::new(&device).unwrap();
+    let gate = SigmoidGate::new(&device, values_host.len() as u32).unwrap();
     let mut scheme = Scheme::new(&ctx);
     gate.record(&mut scheme, values.view(), logits.view())
         .unwrap();
@@ -187,7 +189,7 @@ fn softcapped_swiglu_matches_cpu_reference() {
         TensorDType::F32,
     )
     .unwrap();
-    let act = SoftcappedSwiGlu::new(&device, 1.0, 10.0).unwrap();
+    let act = SoftcappedSwiGlu::new(&device, gate_host.len() as u32, 1.0, 10.0).unwrap();
     let mut scheme = Scheme::new(&ctx);
     act.record(&mut scheme, gate.view(), up.view(), out.view())
         .unwrap();
@@ -574,6 +576,8 @@ fn wide_clip_and_conv_match_reference() {
     .unwrap();
     let clip = HeadL2Clip::with_log_scale(
         &device,
+        heads as u32,
+        dim as u32,
         1.5,
         LogPositionScale {
             alpha: 0.3,
@@ -591,13 +595,10 @@ fn wide_clip_and_conv_match_reference() {
         &cpu_ref::head_l2_clip(&x_host, heads, dim, Some(&scale_host), 1.5, 0.3, 4.0, 9),
     );
 
-    let empty = Tensor::zeros(&device, TensorShape::matrix(0, 4), TensorDType::F32).unwrap();
-    let plain = HeadL2Clip::new(&device, 1.0).unwrap();
-    let mut scheme = Scheme::new(&ctx);
-    let err = plain
-        .record(&mut scheme, empty.view(), None, &step, empty.view())
-        .unwrap_err();
-    assert!(err.to_string().contains("heads"), "{err}");
+    let err = HeadL2Clip::new(&device, 0, 4, 1.0)
+        .err()
+        .expect("zero heads");
+    assert!(err.to_string().contains("head"), "{err}");
 
     let channels = 1000usize;
     let kernel = 4usize;
@@ -698,7 +699,7 @@ fn matches_pinned_transformers_modules() {
     ] {
         let x = vector(&device, &goldens::SOFTCAP_25_X);
         let out = Tensor::zeros(&device, TensorShape::vector(300), TensorDType::F32).unwrap();
-        let op = Softcap::new(&device, cap).unwrap();
+        let op = Softcap::new(&device, 300, cap).unwrap();
         let mut scheme = Scheme::new(&ctx);
         op.record(&mut scheme, x.view(), out.view()).unwrap();
         let err = max_abs(&read_f32(&mut scheme, out.buffer()), y);
@@ -708,7 +709,7 @@ fn matches_pinned_transformers_modules() {
     let gate = vector(&device, &goldens::SWIGLU_GATE);
     let up = vector(&device, &goldens::SWIGLU_UP);
     let out = Tensor::zeros(&device, TensorShape::vector(280), TensorDType::F32).unwrap();
-    let sw = SoftcappedSwiGlu::new(&device, 4.0, 25.0).unwrap();
+    let sw = SoftcappedSwiGlu::new(&device, 280, 4.0, 25.0).unwrap();
     let mut scheme = Scheme::new(&ctx);
     sw.record(&mut scheme, gate.view(), up.view(), out.view())
         .unwrap();
@@ -720,6 +721,8 @@ fn matches_pinned_transformers_modules() {
     let out = Tensor::zeros(&device, TensorShape::matrix(3, 8), TensorDType::F32).unwrap();
     let clip = HeadL2Clip::with_log_scale(
         &device,
+        3,
+        8,
         1.5,
         LogPositionScale {
             alpha: 0.3,

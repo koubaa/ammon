@@ -2,7 +2,10 @@
 //! the caller supplies activations, weights, and persistent cache. Modules never
 //! submit schemes or bind exchanges.
 
-use crate::blocks::{attention_splits, AttentionSites, Blocks, FfnSites, NormScratch};
+use crate::blocks::{
+    attention_splits, AttentionSites, Blocks, ClipScratch, ConvScratch, DynamicConvScratch,
+    FfnSites, NormScratch, SoftcapScratch, SwiGluScratch,
+};
 use goldy::{
     Buffer, GoldyError, Runtime, Scheme, SchemeLabel, Tensor, TensorDType, TensorShape, TensorView,
 };
@@ -96,6 +99,172 @@ impl Norm {
     }
 }
 
+fn f32_vector(runtime: &Runtime, len: u32) -> Result<Tensor, GoldyError> {
+    Tensor::zeros(runtime, TensorShape::vector(len), TensorDType::F32)
+}
+
+/// Scratch of a softcap over `len` elements.
+struct SoftcapBuffers {
+    scaled: Tensor,
+    curved: Tensor,
+}
+
+impl SoftcapBuffers {
+    /// `None` for a unit cap, which is one tanh.
+    fn new(runtime: &Runtime, len: u32, cap: f32) -> Result<Option<Self>, GoldyError> {
+        if cap == 1.0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            scaled: f32_vector(runtime, len)?,
+            curved: f32_vector(runtime, len)?,
+        }))
+    }
+
+    fn sites<'a>(
+        this: &'a Option<Self>,
+        dims: &[u32],
+    ) -> Result<Option<SoftcapScratch<'a>>, GoldyError> {
+        this.as_ref()
+            .map(|b| {
+                Ok(SoftcapScratch {
+                    scaled: b.scaled.view().reshape(dims)?,
+                    curved: b.curved.view().reshape(dims)?,
+                })
+            })
+            .transpose()
+    }
+}
+
+/// Scratch of a softcapped SwiGLU over `len` elements.
+struct SwiGluBuffers {
+    gate_cap: Option<SoftcapBuffers>,
+    up_cap: Option<SoftcapBuffers>,
+    gate: Tensor,
+    up: Tensor,
+    sigmoid: Tensor,
+    gated: Tensor,
+}
+
+impl SwiGluBuffers {
+    fn new(runtime: &Runtime, len: u32, gate_cap: f32, up_cap: f32) -> Result<Self, GoldyError> {
+        Ok(Self {
+            gate_cap: SoftcapBuffers::new(runtime, len, gate_cap)?,
+            up_cap: SoftcapBuffers::new(runtime, len, up_cap)?,
+            gate: f32_vector(runtime, len)?,
+            up: f32_vector(runtime, len)?,
+            sigmoid: f32_vector(runtime, len)?,
+            gated: f32_vector(runtime, len)?,
+        })
+    }
+
+    fn sites(&self, dims: &[u32]) -> Result<SwiGluScratch<'_>, GoldyError> {
+        Ok(SwiGluScratch {
+            gate_cap: SoftcapBuffers::sites(&self.gate_cap, dims)?,
+            up_cap: SoftcapBuffers::sites(&self.up_cap, dims)?,
+            gate: self.gate.view().reshape(dims)?,
+            up: self.up.view().reshape(dims)?,
+            sigmoid: self.sigmoid.view().reshape(dims)?,
+            gated: self.gated.view().reshape(dims)?,
+        })
+    }
+}
+
+/// Scratch of a causal convolution over `[channels]`.
+struct ConvBuffers {
+    dot: Tensor,
+    summed: Tensor,
+}
+
+impl ConvBuffers {
+    fn new(runtime: &Runtime, channels: u32) -> Result<Self, GoldyError> {
+        Ok(Self {
+            dot: f32_vector(runtime, channels)?,
+            summed: f32_vector(runtime, channels)?,
+        })
+    }
+
+    fn sites(&self) -> ConvScratch<'_> {
+        ConvScratch {
+            dot: self.dot.view(),
+            summed: self.summed.view(),
+        }
+    }
+}
+
+/// Scratch of a dynamic causal convolution over `[heads, head_dim]` rows.
+struct DynamicConvBuffers {
+    weight: Tensor,
+    dot: Tensor,
+    summed: Tensor,
+}
+
+impl DynamicConvBuffers {
+    fn new(runtime: &Runtime, heads: u32, head_dim: u32, kernel: u32) -> Result<Self, GoldyError> {
+        let f = TensorDType::F32;
+        let rows = TensorShape::matrix(heads, head_dim);
+        Ok(Self {
+            weight: Tensor::zeros(
+                runtime,
+                TensorShape::from_dims(&[kernel, heads, head_dim])?,
+                f,
+            )?,
+            dot: Tensor::zeros(runtime, rows, f)?,
+            summed: Tensor::zeros(runtime, rows, f)?,
+        })
+    }
+
+    fn sites(&self) -> DynamicConvScratch<'_> {
+        DynamicConvScratch {
+            weight: self.weight.view(),
+            dot: self.dot.view(),
+            summed: self.summed.view(),
+        }
+    }
+}
+
+/// Convolution scratch of the K or V stream of a [`DecodeAttention`].
+enum KvConvBuffers {
+    Static(ConvBuffers),
+    Dynamic(DynamicConvBuffers),
+}
+
+/// Scratch of a per-head L2 clip over `[heads, dim]`.
+struct ClipBuffers {
+    scaled: Tensor,
+    square: Tensor,
+    factor: Tensor,
+}
+
+impl ClipBuffers {
+    fn new(runtime: &Runtime, heads: u32, dim: u32) -> Result<Self, GoldyError> {
+        let f = TensorDType::F32;
+        Ok(Self {
+            scaled: Tensor::zeros(runtime, TensorShape::matrix(heads, dim), f)?,
+            square: Tensor::zeros(runtime, TensorShape::matrix(heads, dim), f)?,
+            factor: Tensor::zeros(runtime, TensorShape::matrix(heads, 1), f)?,
+        })
+    }
+
+    fn sites(&self) -> ClipScratch<'_> {
+        ClipScratch {
+            scaled: self.scaled.view(),
+            square: self.square.view(),
+            factor: self.factor.view(),
+        }
+    }
+}
+
+fn require_len(what: &str, x: TensorView<'_>, len: u32) -> Result<(), GoldyError> {
+    if x.numel_u32() != len {
+        return Err(GoldyError::Validation(format!(
+            "{what}: {} elements, but this module's scratch holds {len}",
+            x.numel_u32()
+        )));
+    }
+    Ok(())
+}
+
 pub use crate::kernels::DEFAULT_RMS_EPS;
 
 /// Token embedding table gather. No decode scratch.
@@ -139,25 +308,42 @@ impl Embedding {
 /// [`Self::with_eps`] says otherwise. [`Self::record_unweighted`] omits the gain.
 /// It is recorded as tensor operations, which automatic fusion composes with the
 /// operations around them.
+///
+/// The module owns the scratch of a `dim`-element input, and every record binds
+/// it, so the module must outlive the schemes it records into.
 pub struct RmsNorm {
     blocks: Arc<Blocks>,
+    norm: Norm,
+    /// Normalized copy an in-place record writes back over `x`.
+    normalized: Tensor,
+    dim: u32,
     eps: f32,
 }
 
 impl RmsNorm {
-    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
-        Self::with_eps(runtime, DEFAULT_RMS_EPS)
+    pub fn new(runtime: &Runtime, dim: u32) -> anyhow::Result<Self> {
+        Self::with_eps(runtime, dim, DEFAULT_RMS_EPS)
     }
 
-    pub fn with_eps(runtime: &Runtime, eps: f32) -> anyhow::Result<Self> {
+    pub fn with_eps(runtime: &Runtime, dim: u32, eps: f32) -> anyhow::Result<Self> {
+        if dim == 0 {
+            anyhow::bail!("RMSNorm width must be non-zero");
+        }
         Ok(Self {
             blocks: blocks(runtime)?,
+            norm: Norm::new(runtime, dim)?,
+            normalized: f32_vector(runtime, dim)?,
+            dim,
             eps,
         })
     }
 
     pub fn eps(&self) -> f32 {
         self.eps
+    }
+
+    pub fn dim(&self) -> u32 {
+        self.dim
     }
 
     pub fn record(
@@ -167,7 +353,7 @@ impl RmsNorm {
         weight: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.blocks.record_rmsnorm(scheme, x, weight, out, self.eps)
+        self.record_out(scheme, x, Some(weight), out)
     }
 
     pub fn record_inplace(
@@ -176,8 +362,7 @@ impl RmsNorm {
         x: TensorView<'_>,
         weight: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.blocks
-            .record_rmsnorm_inplace(scheme, x, weight, self.eps)
+        self.record_over(scheme, x, Some(weight))
     }
 
     /// `out = x * rsqrt(mean(x²) + eps)`, with no gain vector.
@@ -187,8 +372,7 @@ impl RmsNorm {
         x: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.blocks
-            .record_rmsnorm_unweighted(scheme, x, out, self.eps)
+        self.record_out(scheme, x, None, out)
     }
 
     /// In-place form of [`Self::record_unweighted`].
@@ -197,8 +381,36 @@ impl RmsNorm {
         scheme: &mut Scheme,
         x: TensorView<'_>,
     ) -> Result<(), GoldyError> {
+        self.record_over(scheme, x, None)
+    }
+
+    fn record_out(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: Option<TensorView<'_>>,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        require_len("rms norm", x, self.dim)?;
         self.blocks
-            .record_rmsnorm_unweighted_inplace(scheme, x, self.eps)
+            .record_rmsnorm(scheme, x, weight, out, self.norm.sites(), self.eps)
+    }
+
+    fn record_over(
+        &self,
+        scheme: &mut Scheme,
+        x: TensorView<'_>,
+        weight: Option<TensorView<'_>>,
+    ) -> Result<(), GoldyError> {
+        require_len("rms norm", x, self.dim)?;
+        self.blocks.record_rmsnorm_inplace(
+            scheme,
+            x,
+            weight,
+            self.norm.sites(),
+            self.normalized.view(),
+            self.eps,
+        )
     }
 }
 
@@ -443,33 +655,57 @@ pub struct LogPositionScale {
 ///
 /// `y = s * min(1, threshold / (||s||_2 + 1e-6))` with `s = x` or `s = x * scale`,
 /// then `y *= log_scale(position)` when a log scale is set.
+///
+/// A clip without a log scale also states itself as tensor operations, through
+/// `[heads, dim]` scratch this module owns.
 pub struct HeadL2Clip {
     blocks: Arc<Blocks>,
     threshold: f32,
     log: Option<LogPositionScale>,
+    heads: u32,
+    dim: u32,
+    /// `None` with a log scale, which no tensor operation states.
+    scratch: Option<ClipBuffers>,
 }
 
 impl HeadL2Clip {
-    pub fn new(runtime: &Runtime, threshold: f32) -> anyhow::Result<Self> {
-        Ok(Self {
-            blocks: blocks(runtime)?,
-            threshold,
-            log: None,
-        })
+    pub fn new(runtime: &Runtime, heads: u32, dim: u32, threshold: f32) -> anyhow::Result<Self> {
+        Self::build(runtime, heads, dim, threshold, None)
     }
 
     pub fn with_log_scale(
         runtime: &Runtime,
+        heads: u32,
+        dim: u32,
         threshold: f32,
         log: LogPositionScale,
     ) -> anyhow::Result<Self> {
         if log.alpha != 0.0 && log.floor <= 0.0 {
             anyhow::bail!("log-position floor must be positive");
         }
+        Self::build(runtime, heads, dim, threshold, Some(log))
+    }
+
+    fn build(
+        runtime: &Runtime,
+        heads: u32,
+        dim: u32,
+        threshold: f32,
+        log: Option<LogPositionScale>,
+    ) -> anyhow::Result<Self> {
+        if heads == 0 || dim == 0 {
+            anyhow::bail!("l2 clip needs a positive head count and width");
+        }
+        let logged = log.is_some_and(|log| log.alpha != 0.0);
         Ok(Self {
             blocks: blocks(runtime)?,
             threshold,
-            log: Some(log),
+            log,
+            heads,
+            dim,
+            scratch: (!logged)
+                .then(|| ClipBuffers::new(runtime, heads, dim))
+                .transpose()?,
         })
     }
 
@@ -489,10 +725,11 @@ impl HeadL2Clip {
         step: &Buffer,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        if x.shape().rank() != 2 || out.shape().dims() != x.shape().dims() {
-            return Err(GoldyError::Validation(
-                "l2 clip: x and out must be matching rank-2 [heads, dim] tensors".into(),
-            ));
+        if x.shape().dims() != [self.heads, self.dim] || out.shape().dims() != x.shape().dims() {
+            return Err(GoldyError::Validation(format!(
+                "l2 clip: x and out must be [{}, {}]",
+                self.heads, self.dim
+            )));
         }
         let (scale, use_scale) = match scale {
             Some(scale) => {
@@ -517,20 +754,28 @@ impl HeadL2Clip {
             alpha,
             floor,
             use_scale,
+            self.scratch.as_ref().map(ClipBuffers::sites),
         )
     }
 }
 
-/// `out = cap * tanh(x / cap)`, using `goldy::gpu::tanh`.
+/// `out = cap * tanh(x / cap)` over `len` elements, using `goldy::gpu::tanh`.
+///
+/// A unit cap is one tanh. Any other cap divides, takes the tanh, and
+/// multiplies through scratch this module owns.
 pub struct Softcap {
     blocks: Arc<Blocks>,
+    scratch: Option<SoftcapBuffers>,
+    len: u32,
     cap: f32,
 }
 
 impl Softcap {
-    pub fn new(runtime: &Runtime, cap: f32) -> anyhow::Result<Self> {
+    pub fn new(runtime: &Runtime, len: u32, cap: f32) -> anyhow::Result<Self> {
         Ok(Self {
             blocks: blocks(runtime)?,
+            scratch: SoftcapBuffers::new(runtime, len, cap)?,
+            len,
             cap,
         })
     }
@@ -548,19 +793,27 @@ impl Softcap {
         if out.shape().dims() != x.shape().dims() {
             return Err(GoldyError::Validation("softcap: out must match x".into()));
         }
-        self.blocks.record_softcap(scheme, x, out, self.cap)
+        require_len("softcap", x, self.len)?;
+        let scratch = SoftcapBuffers::sites(&self.scratch, x.shape().dims())?;
+        self.blocks
+            .record_softcap(scheme, x, out, self.cap, scratch)
     }
 }
 
-/// In-place `values *= sigmoid(logits)`, using `goldy::gpu::sigmoid`.
+/// In-place `values *= sigmoid(logits)` over `len` elements, using
+/// `goldy::gpu::sigmoid`. The sigmoid is stored on this module.
 pub struct SigmoidGate {
     blocks: Arc<Blocks>,
+    gate: Tensor,
+    len: u32,
 }
 
 impl SigmoidGate {
-    pub fn new(runtime: &Runtime) -> anyhow::Result<Self> {
+    pub fn new(runtime: &Runtime, len: u32) -> anyhow::Result<Self> {
         Ok(Self {
             blocks: blocks(runtime)?,
+            gate: f32_vector(runtime, len)?,
+            len,
         })
     }
 
@@ -575,24 +828,32 @@ impl SigmoidGate {
                 "sigmoid gate: logits must match values".into(),
             ));
         }
-        self.blocks.record_sigmoid_gate(scheme, values, logits)
+        require_len("sigmoid gate", values, self.len)?;
+        let gate = self.gate.view().reshape(values.shape().dims())?;
+        self.blocks
+            .record_sigmoid_gate(scheme, values, logits, gate)
     }
 }
 
-/// `out = softcap(gate) * sigmoid(gate) * softcap(up)`.
+/// `out = softcap(gate) * sigmoid(gate) * softcap(up)` over `len` elements.
 ///
 /// `sigmoid` sees the raw gate and is `goldy::gpu::sigmoid`. `gate_cap` bounds
-/// only the linear gate factor. Both caps use `goldy::gpu::tanh`.
+/// only the linear gate factor. Both caps use `goldy::gpu::tanh`. The
+/// intermediates are stored on this module.
 pub struct SoftcappedSwiGlu {
     blocks: Arc<Blocks>,
+    scratch: SwiGluBuffers,
+    len: u32,
     gate_cap: f32,
     up_cap: f32,
 }
 
 impl SoftcappedSwiGlu {
-    pub fn new(runtime: &Runtime, gate_cap: f32, up_cap: f32) -> anyhow::Result<Self> {
+    pub fn new(runtime: &Runtime, len: u32, gate_cap: f32, up_cap: f32) -> anyhow::Result<Self> {
         Ok(Self {
             blocks: blocks(runtime)?,
+            scratch: SwiGluBuffers::new(runtime, len, gate_cap, up_cap)?,
+            len,
             gate_cap,
             up_cap,
         })
@@ -610,8 +871,16 @@ impl SoftcappedSwiGlu {
                 "softcapped swiglu: gate, up, and out must match".into(),
             ));
         }
-        self.blocks
-            .record_softcapped_swiglu(scheme, gate, up, out, self.gate_cap, self.up_cap)
+        require_len("softcapped swiglu", gate, self.len)?;
+        self.blocks.record_softcapped_swiglu(
+            scheme,
+            gate,
+            up,
+            out,
+            self.gate_cap,
+            self.up_cap,
+            self.scratch.sites(gate.shape().dims())?,
+        )
     }
 }
 
@@ -634,6 +903,8 @@ fn require_conv_shape(channels: u32, kernel_size: u32) -> anyhow::Result<()> {
 pub struct ShortConv {
     blocks: Arc<Blocks>,
     state: Tensor,
+    /// Position-addressed records only.
+    conv: ConvBuffers,
     channels: u32,
     kernel_size: u32,
 }
@@ -648,6 +919,7 @@ impl ShortConv {
                 TensorShape::matrix(channels, kernel_size),
                 TensorDType::F32,
             )?,
+            conv: ConvBuffers::new(runtime, channels)?,
             channels,
             kernel_size,
         })
@@ -720,7 +992,7 @@ impl ShortConv {
             ));
         }
         self.blocks
-            .record_short_conv_at(scheme, x, weight, state, step, out)
+            .record_short_conv_at(scheme, x, weight, state, step, out, self.conv.sites())
     }
 }
 
@@ -1159,10 +1431,13 @@ pub struct DecodeAttention {
     q_clip: HeadL2Clip,
     k_clip: HeadL2Clip,
     rel_clip: HeadL2Clip,
-    v_norm: RmsNorm,
+    /// One per KV head, so the head norms bind separate scratch.
+    v_norm: Vec<Norm>,
+    rms_eps: f32,
     gate: SigmoidGate,
-    dynamic: bool,
     taps: Tensor,
+    k_conv_scratch: KvConvBuffers,
+    v_conv_scratch: KvConvBuffers,
     kernel: u32,
     kind: DecodeAttentionKind,
     q_heads: u32,
@@ -1236,12 +1511,24 @@ impl DecodeAttention {
         let tap_rows = if dynamic_conv { kv_heads } else { 1 };
         let tap_cols = if dynamic_conv { conv_kernel } else { 1 };
         let q_clip = match log_scale {
-            Some(log) => HeadL2Clip::with_log_scale(runtime, qk_l2_clip, log)?,
-            None => HeadL2Clip::new(runtime, qk_l2_clip)?,
+            Some(log) => HeadL2Clip::with_log_scale(runtime, q_heads, head_dim, qk_l2_clip, log)?,
+            None => HeadL2Clip::new(runtime, q_heads, head_dim, qk_l2_clip)?,
         };
         let rel_clip = match log_scale {
-            Some(log) => HeadL2Clip::with_log_scale(runtime, rel_l2_clip, log)?,
-            None => HeadL2Clip::new(runtime, rel_l2_clip)?,
+            Some(log) => HeadL2Clip::with_log_scale(runtime, q_heads, d_rel, rel_l2_clip, log)?,
+            None => HeadL2Clip::new(runtime, q_heads, d_rel, rel_l2_clip)?,
+        };
+        let conv_scratch = || -> Result<KvConvBuffers, GoldyError> {
+            Ok(if dynamic_conv {
+                KvConvBuffers::Dynamic(DynamicConvBuffers::new(
+                    runtime,
+                    kv_heads,
+                    head_dim,
+                    conv_kernel,
+                )?)
+            } else {
+                KvConvBuffers::Static(ConvBuffers::new(runtime, kv_heads * head_dim)?)
+            })
         };
         let f = TensorDType::F32;
         let matrix = |rows, cols| Tensor::zeros(runtime, TensorShape::matrix(rows, cols), f);
@@ -1250,12 +1537,16 @@ impl DecodeAttention {
             blocks: blocks(runtime)?,
             linear: Linear::new(runtime)?,
             q_clip,
-            k_clip: HeadL2Clip::new(runtime, qk_l2_clip)?,
+            k_clip: HeadL2Clip::new(runtime, kv_heads, head_dim, qk_l2_clip)?,
             rel_clip,
-            v_norm: RmsNorm::with_eps(runtime, rms_eps)?,
-            gate: SigmoidGate::new(runtime)?,
-            dynamic: dynamic_conv,
+            v_norm: (0..kv_heads)
+                .map(|_| Norm::new(runtime, head_dim))
+                .collect::<Result<_, _>>()?,
+            rms_eps,
+            gate: SigmoidGate::new(runtime, q_dim)?,
             taps: matrix(tap_rows, tap_cols)?,
+            k_conv_scratch: conv_scratch()?,
+            v_conv_scratch: conv_scratch()?,
             kernel: conv_kernel,
             kind,
             q_heads,
@@ -1349,6 +1640,7 @@ impl DecodeAttention {
             k_hidden,
             &self.k_proj,
             &self.k_conv,
+            &self.k_conv_scratch,
             weights.k_conv,
             weights.k_conv_proj,
             state.k_conv.view(),
@@ -1363,19 +1655,21 @@ impl DecodeAttention {
             v_hidden,
             &self.v_proj,
             &self.v_conv,
+            &self.v_conv_scratch,
             weights.v_conv,
             weights.v_conv_proj,
             state.v_conv.view(),
             step,
         )?;
-        for h in 0..self.kv_heads {
+        for (h, norm) in (0..self.kv_heads).zip(&self.v_norm) {
             let src = self
                 .v_conv
                 .view()
                 .narrow(0, h, 1)?
                 .reshape(&[self.head_dim])?;
             let dst = self.v.view().narrow(0, h, 1)?.reshape(&[self.head_dim])?;
-            self.v_norm.record_unweighted(scheme, src, dst)?;
+            self.blocks
+                .record_rmsnorm(scheme, src, None, dst, norm.sites(), self.rms_eps)?;
         }
 
         self.blocks.record_kv_cache_store(
@@ -1444,6 +1738,7 @@ impl DecodeAttention {
         hidden: TensorView<'_>,
         proj: &Tensor,
         conv_out: &Tensor,
+        conv_scratch: &KvConvBuffers,
         conv_weight: TensorView<'_>,
         conv_proj: Option<TensorView<'_>>,
         conv_state: TensorView<'_>,
@@ -1451,34 +1746,36 @@ impl DecodeAttention {
     ) -> Result<(), GoldyError> {
         self.linear.record(scheme, weight, hidden, proj.view())?;
         let out = conv_out.view().reshape(&[proj.view().numel_u32()])?;
-        if self.dynamic {
-            let proj_w = conv_proj.ok_or_else(|| {
-                GoldyError::Validation("dynamic conv requires a tap projection".into())
-            })?;
-            let tap_len = self.kv_heads * self.kernel;
-            let flat = self.taps.view().reshape(&[tap_len])?;
-            self.blocks
-                .record_linear(scheme, "conv_taps", proj_w, hidden, flat)?;
-            self.blocks.record_dynamic_short_conv_at(
+        match conv_scratch {
+            KvConvBuffers::Dynamic(scratch) => {
+                let proj_w = conv_proj.ok_or_else(|| {
+                    GoldyError::Validation("dynamic conv requires a tap projection".into())
+                })?;
+                let tap_len = self.kv_heads * self.kernel;
+                let flat = self.taps.view().reshape(&[tap_len])?;
+                self.blocks
+                    .record_linear(scheme, "conv_taps", proj_w, hidden, flat)?;
+                self.blocks.record_dynamic_short_conv_at(
+                    scheme,
+                    proj.view(),
+                    conv_weight,
+                    self.taps.view(),
+                    conv_state,
+                    step,
+                    out,
+                    scratch.sites(),
+                )
+            }
+            KvConvBuffers::Static(scratch) => self.blocks.record_short_conv_at(
                 scheme,
                 proj.view(),
                 conv_weight,
-                self.taps.view(),
                 conv_state,
                 step,
                 out,
-            )?;
-        } else {
-            self.blocks.record_short_conv_at(
-                scheme,
-                proj.view(),
-                conv_weight,
-                conv_state,
-                step,
-                out,
-            )?;
+                scratch.sites(),
+            ),
         }
-        Ok(())
     }
 
     fn expect_matrix(
@@ -1511,7 +1808,6 @@ impl DecodeAttention {
 pub struct DecodeMoe {
     blocks: Arc<Blocks>,
     linear: Linear,
-    swiglu: SoftcappedSwiGlu,
     n_experts: u32,
     top_k: u32,
     hidden: u32,
@@ -1520,7 +1816,32 @@ pub struct DecodeMoe {
     logits: Tensor,
     ids: Tensor,
     weights: Tensor,
+    batch: ExpertBatch,
+    /// `[intermediate]`, shared by the packed slots.
     activated: Tensor,
+    packed: Vec<PackedSlot>,
+}
+
+/// Scratch of the f32 experts, recorded for every slot at once: the gate and up
+/// products and their activation, `[top_k * intermediate]`, then the down
+/// projections and their routing-weighted rows, `[top_k * hidden]`.
+struct ExpertBatch {
+    gate: Tensor,
+    up: Tensor,
+    activated: Tensor,
+    swiglu: SoftcappedSwiGlu,
+    projected: Tensor,
+    scaled: Tensor,
+}
+
+/// Scratch of one packed expert slot: the stacked gate-up product,
+/// `[2 * intermediate]`, then the down projection and its routing-weighted
+/// copy, `[hidden]`.
+struct PackedSlot {
+    fused: Tensor,
+    swiglu: SoftcappedSwiGlu,
+    projected: Tensor,
+    scaled: Tensor,
 }
 
 impl DecodeMoe {
@@ -1540,20 +1861,40 @@ impl DecodeMoe {
         if top_k == 0 || top_k > n_experts {
             anyhow::bail!("MoE top-k {top_k} must be in 1..={n_experts}");
         }
-        let f = TensorDType::F32;
+        let vector = |len| f32_vector(runtime, len);
+        let batched = top_k * intermediate;
+        let batch = ExpertBatch {
+            gate: vector(batched)?,
+            up: vector(batched)?,
+            activated: vector(batched)?,
+            swiglu: SoftcappedSwiGlu::new(runtime, batched, gate_cap, up_cap)?,
+            projected: vector(top_k * hidden)?,
+            scaled: vector(top_k * hidden)?,
+        };
+        let packed = (0..top_k)
+            .map(|_| {
+                Ok(PackedSlot {
+                    fused: vector(2 * intermediate)?,
+                    swiglu: SoftcappedSwiGlu::new(runtime, intermediate, gate_cap, up_cap)?,
+                    projected: vector(hidden)?,
+                    scaled: vector(hidden)?,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             blocks: blocks(runtime)?,
             linear: Linear::new(runtime)?,
-            swiglu: SoftcappedSwiGlu::new(runtime, gate_cap, up_cap)?,
             n_experts,
             top_k,
             hidden,
             intermediate,
             route_scale,
-            logits: Tensor::zeros(runtime, TensorShape::vector(n_experts), f)?,
+            logits: vector(n_experts)?,
             ids: Tensor::zeros(runtime, TensorShape::vector(top_k), TensorDType::U32)?,
-            weights: Tensor::zeros(runtime, TensorShape::vector(top_k), f)?,
-            activated: Tensor::zeros(runtime, TensorShape::vector(intermediate), f)?,
+            weights: vector(top_k)?,
+            batch,
+            activated: vector(intermediate)?,
+            packed,
         })
     }
 
@@ -1694,16 +2035,11 @@ impl DecodeMoe {
             self.weights.view(),
             self.route_scale,
         )?;
-        let fused_len = 2 * self.intermediate;
         if let (ExpertWeight::F32(gate_w), ExpertWeight::F32(down_w)) = (gate_up, down) {
             return self.record_f32_experts(scheme, x, gate_w, down_w, out);
         }
-        for slot in 0..self.top_k {
-            let fused = Tensor::zeros(
-                self.blocks.runtime(),
-                TensorShape::vector(fused_len),
-                TensorDType::F32,
-            )?;
+        for (slot, scratch) in (0..self.top_k).zip(&self.packed) {
+            let fused = &scratch.fused;
             match gate_up {
                 ExpertWeight::F32(weight) => self.blocks.record_indexed_matmul(
                     scheme,
@@ -1729,13 +2065,10 @@ impl DecodeMoe {
             let rows = fused.view().reshape(&[2, self.intermediate])?;
             let gate = rows.narrow(0, 0, 1)?.reshape(&[self.intermediate])?;
             let up = rows.narrow(0, 1, 1)?.reshape(&[self.intermediate])?;
-            self.swiglu
+            scratch
+                .swiglu
                 .record(scheme, gate, up, self.activated.view())?;
-            let projected = Tensor::zeros(
-                self.blocks.runtime(),
-                TensorShape::vector(self.hidden),
-                TensorDType::F32,
-            )?;
+            let projected = &scratch.projected;
             match down {
                 ExpertWeight::F32(weight) => self.blocks.record_indexed_matmul(
                     scheme,
@@ -1759,12 +2092,10 @@ impl DecodeMoe {
                 )?,
             }
             let weight = self.weights.view().narrow(0, slot, 1)?;
+            let scaled = scratch.scaled.view();
             let mut rec = self.blocks.tensor_recorder(scheme);
-            let scaled = rec.mul("moe_scale", projected.view(), weight)?;
-            rec.add_into("moe_accum", out, scaled.view(), out)?;
-            for kept in [fused, projected, scaled] {
-                scheme.keep_alive(kept);
-            }
+            rec.mul_into("moe_scale", projected.view(), weight, scaled)?;
+            rec.add_into("moe_accum", out, scaled, out)?;
         }
         Ok(())
     }
@@ -1787,15 +2118,15 @@ impl DecodeMoe {
     ) -> Result<(), GoldyError> {
         let k = self.top_k;
         let inter = self.intermediate;
-        let scratch = || {
-            Tensor::zeros(
-                self.blocks.runtime(),
-                TensorShape::vector(k * inter),
-                TensorDType::F32,
-            )
-        };
-        let (gate, up, activated) = (scratch()?, scratch()?, scratch()?);
-        for (label, half, product) in [("moe_gate", 0, &gate), ("moe_up", 1, &up)] {
+        let ExpertBatch {
+            gate,
+            up,
+            activated,
+            swiglu,
+            projected,
+            scaled,
+        } = &self.batch;
+        for (label, half, product) in [("moe_gate", 0, gate), ("moe_up", 1, up)] {
             self.blocks.record_indexed_matmul_batch(
                 scheme,
                 label,
@@ -1811,21 +2142,11 @@ impl DecodeMoe {
         fn by_slot(t: &Tensor, k: u32, inter: u32) -> Result<TensorView<'_>, GoldyError> {
             t.view().reshape(&[k, inter])
         }
-        self.swiglu.record(
+        swiglu.record(
             scheme,
-            by_slot(&gate, k, inter)?,
-            by_slot(&up, k, inter)?,
-            by_slot(&activated, k, inter)?,
-        )?;
-        let projected = Tensor::zeros(
-            self.blocks.runtime(),
-            TensorShape::vector(k * self.hidden),
-            TensorDType::F32,
-        )?;
-        let scaled = Tensor::zeros(
-            self.blocks.runtime(),
-            TensorShape::vector(k * self.hidden),
-            TensorDType::F32,
+            by_slot(gate, k, inter)?,
+            by_slot(up, k, inter)?,
+            by_slot(activated, k, inter)?,
         )?;
         for slot in 0..k {
             fn rows(t: &Tensor, slot: u32, len: u32) -> Result<TensorView<'_>, GoldyError> {
@@ -1841,15 +2162,12 @@ impl DecodeMoe {
                     .narrow(0, slot * self.intermediate, self.intermediate)?,
                 self.ids.view(),
                 slot,
-                row(&projected)?,
+                row(projected)?,
             )?;
             let weight = self.weights.view().narrow(0, slot, 1)?;
             let mut rec = self.blocks.tensor_recorder(scheme);
-            rec.mul_into("moe_scale", row(&projected)?, weight, row(&scaled)?)?;
-            rec.add_into("moe_accum", out, row(&scaled)?, out)?;
-        }
-        for kept in [gate, up, activated, projected, scaled] {
-            scheme.keep_alive(kept);
+            rec.mul_into("moe_scale", row(projected)?, weight, row(scaled)?)?;
+            rec.add_into("moe_accum", out, row(scaled)?, out)?;
         }
         Ok(())
     }
