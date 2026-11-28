@@ -270,11 +270,10 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        // Every clip without a log scale: query, key and relative on a sliding layer.
-        // Clips and the combine describe reassociated sums, so they fuse only
-        // under relaxed arithmetic; the cache store is exact.
+        // The query, key and relative clips, log-scaled or not. Clips and the
+        // combine describe reassociated sums, so they fuse only under relaxed
+        // arithmetic; the cache store is exact.
         let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
-        let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
         let clips: usize = report
             .regions
             .iter()
@@ -287,12 +286,11 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     .count()
             })
             .sum();
-        let expected = match (relaxed, logged) {
-            (false, _) => 0,
-            (true, true) => 1,
-            (true, false) => 3,
-        };
-        assert_eq!(clips, expected, "fused clips: {report:?}");
+        assert_eq!(
+            clips,
+            if relaxed { 3 } else { 0 },
+            "fused clips: {report:?}"
+        );
         assert_eq!(
             fused("relative_attention_combine"),
             relaxed,

@@ -143,12 +143,14 @@ pub(crate) struct DynamicConvScratch<'a> {
 }
 
 /// Scratch of a per-head L2 clip described as tensor operations: the scaled
-/// input and its squares, each `[heads, dim]`, and the clip factor, `[heads, 1]`.
+/// input and its squares, each `[heads, dim]`, the clip factor, `[heads, 1]`, and
+/// the log-position factor, `[1]`.
 #[derive(Clone, Copy)]
 pub(crate) struct ClipScratch<'a> {
     pub scaled: TensorView<'a>,
     pub square: TensorView<'a>,
     pub factor: TensorView<'a>,
+    pub log_factor: TensorView<'a>,
 }
 
 /// Scratch of the split-attention combine described as tensor operations. Per split:
@@ -531,7 +533,7 @@ impl Blocks {
         alpha: f32,
         floor: f32,
         use_scale: u32,
-        scratch: Option<ClipScratch<'_>>,
+        scratch: ClipScratch<'_>,
     ) -> Result<(), GoldyError> {
         let heads = x.shape().dim(0)?;
         if heads == 0 {
@@ -546,17 +548,16 @@ impl Blocks {
             )?
             .groups([heads, 1, 1])
             .node();
-        // The log-position factor reads the position as a number, which no site states.
-        if alpha != 0.0 {
-            return Ok(());
-        }
         let ClipScratch {
             scaled,
             square,
             factor: f,
-        } = scratch.ok_or_else(|| {
-            GoldyError::Validation("l2 clip: a clip without a log scale needs scratch".into())
-        })?;
+            log_factor,
+        } = scratch;
+        let position = TensorView::new(
+            step,
+            TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
+        )?;
         // The kernel sums each head across 256 lanes, so the sequential sum is not its order.
         self.tensors.recorder(scheme).describe(node, false, |rec| {
             let y = if use_scale != 0 {
@@ -572,6 +573,17 @@ impl Blocks {
             rec.reciprocal_into("l2_inverse", f, f)?;
             rec.mul_scalar_into("l2_ratio", f, threshold, f)?;
             rec.min_scalar_into("l2_factor", f, 1.0, f)?;
+            if alpha != 0.0 {
+                let t = log_factor;
+                rec.cast_into("l2_position", position, t)?;
+                rec.add_scalar_into("l2_next", t, 1.0, t)?;
+                rec.div_scalar_into("l2_per_floor", t, floor, t)?;
+                rec.max_scalar_into("l2_at_least_one", t, 1.0, t)?;
+                rec.log_into("l2_log", t, t)?;
+                rec.mul_scalar_into("l2_alpha", t, alpha, t)?;
+                rec.add_scalar_into("l2_log_scale", t, 1.0, t)?;
+                rec.mul_into("l2_log_factor", f, t, f)?;
+            }
             rec.mul_into("l2_clip", y, f, out)
         })
     }
