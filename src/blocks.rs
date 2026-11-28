@@ -655,15 +655,32 @@ impl Blocks {
         state: TensorView<'_>,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
+        if !static_weight.is_contiguous() || !taps.is_contiguous() {
+            return Err(GoldyError::Validation(
+                "dynamic short conv weights and taps must be contiguous".into(),
+            ));
+        }
+        let static_offset = u32::try_from(static_weight.storage_offset()).map_err(|_| {
+            GoldyError::Validation(
+                "dynamic short conv static-weight offset does not fit u32".into(),
+            )
+        })?;
+        let taps_offset = u32::try_from(taps.storage_offset()).map_err(|_| {
+            GoldyError::Validation("dynamic short conv tap offset does not fit u32".into())
+        })?;
+        let heads = taps.shape().dim(0)?;
         self.dynamic_short_conv
             .record(
                 scheme,
                 "dynamic_short_conv",
                 x,
-                static_weight,
-                taps,
+                static_weight.buffer(),
+                taps.buffer(),
                 state,
                 out,
+                static_offset,
+                taps_offset,
+                heads,
             )?
             .over_tensor(&x);
         Ok(())

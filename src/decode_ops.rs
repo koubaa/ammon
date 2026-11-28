@@ -167,10 +167,13 @@ fn short_conv(
 #[goldy::compute(workgroup_size = [256, 1, 1])]
 fn dynamic_short_conv(
     #[tensor(shape = [channels])] x: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [kernel, channels])] static_weight: goldy::gpu::Tensor<f32>,
-    #[tensor(shape = [heads, kernel])] taps: goldy::gpu::Tensor<f32>,
+    static_weight: &[f32],
+    taps: &[f32],
     #[tensor(shape = [channels, kernel])] state: goldy::gpu::TensorMut<f32>,
     #[tensor(shape = [channels])] out: goldy::gpu::TensorWrite<f32>,
+    static_offset: u32,
+    taps_offset: u32,
+    heads: u32,
 ) {
     let c = goldy::gpu::global_id().x;
     if c >= x.len() {
@@ -178,16 +181,16 @@ fn dynamic_short_conv(
     }
     let kernel = state.dim(1);
     let channels = x.len();
-    let heads = taps.dim(0);
     let head_dim = channels / heads;
     let head = c / head_dim;
     let base = c * kernel;
     let cur = x[c];
-    let mut acc = (static_weight[c] + taps[head * kernel]) * cur;
+    let mut acc = (static_weight[static_offset + c] + taps[taps_offset + head * kernel]) * cur;
     let mut lag = 1u32;
     while lag < kernel {
         let token = state[base + kernel - lag];
-        let w = static_weight[lag * channels + c] + taps[head * kernel + lag];
+        let w = static_weight[static_offset + lag * channels + c]
+            + taps[taps_offset + head * kernel + lag];
         acc = acc + w * token;
         lag = lag + 1;
     }
