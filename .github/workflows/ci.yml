@@ -4,7 +4,7 @@
 # as siblings. GPU tests are not optional: the job fails if lavapipe is missing
 # or does not advertise Vulkan 1.4.
 #
-# GOLDY_REF is the goldy checkout: main at the merge of koubaa/goldy#364.
+# GOLDY_REF is the goldy checkout: the merged open goldy PRs, for benchmarking.
 # Indexed GEMV reads the slab in place, and a unit softcap is one tanh
 # inside goldy. Retained command buffers keep their own frame-table rows.
 
@@ -19,7 +19,7 @@ on:
     types: [goldy_main]
 
 env:
-  GOLDY_REF: de00d6100f136ae48b01f6a91c30b8153f3ad800
+  GOLDY_REF: cursor/bench-stack-06c6
 
 jobs:
   test:

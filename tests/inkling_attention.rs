@@ -230,7 +230,7 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[Step<'_>]) {
 }
 
 /// The inference scheme against the reference. With `fusion`, the scheme settles on
-/// the first step, and the key clip and a ring cache store run inside fused regions.
+/// the first step, and the key clip and the cache store run inside fused regions.
 fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: bool) {
     let device = runtime();
     let ctx = device.create_context().unwrap();
@@ -270,14 +270,35 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        // Both describe reassociated sums, so they fuse only under relaxed arithmetic.
+        // Every clip without a log scale: query, key and relative on a sliding layer.
+        // Clips and the combine describe reassociated sums, so they fuse only
+        // under relaxed arithmetic; the cache store is exact.
         let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
-        for name in ["l2_clip", "relative_attention_combine"] {
-            assert_eq!(fused(name), relaxed, "{name} fused: {report:?}");
-        }
-        if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
-            assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
-        }
+        let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
+        let clips: usize = report
+            .regions
+            .iter()
+            .filter(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted))
+            .map(|region| {
+                region
+                    .labels
+                    .iter()
+                    .filter(|label| label.to_string() == "l2_clip")
+                    .count()
+            })
+            .sum();
+        let expected = match (relaxed, logged) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => 3,
+        };
+        assert_eq!(clips, expected, "fused clips: {report:?}");
+        assert_eq!(
+            fused("relative_attention_combine"),
+            relaxed,
+            "combine fused: {report:?}"
+        );
+        assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
     }
     let stats = recorded.replay_stats();
     assert_eq!(
@@ -783,6 +804,16 @@ fn full_cache_replay_past_capacity(fusion: bool) {
         });
         let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
         assert_eq!(combined, relaxed, "combine fused: {report:?}");
+        assert!(
+            report.regions.iter().any(|region| {
+                matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                    && region
+                        .labels
+                        .iter()
+                        .any(|label| label.to_string() == "kv_cache_store")
+            }),
+            "no fused cache store: {report:?}"
+        );
     }
     let mut read = Scheme::new(&ctx);
     let after_zero = read_f32(&mut read, cache.keys().buffer());
