@@ -1505,6 +1505,7 @@ pub struct DecodeAttention {
     d_rel: u32,
     rel_extent: u32,
     scale: f32,
+    q_proj: Tensor,
     q: Tensor,
     k_proj: Tensor,
     k_conv: Tensor,
@@ -1614,6 +1615,7 @@ impl DecodeAttention {
             d_rel,
             rel_extent,
             scale: (f64::from(head_dim)).powf(-0.5) as f32,
+            q_proj: matrix(q_heads, head_dim)?,
             q: matrix(q_heads, head_dim)?,
             k_proj: vector(kv_dim)?,
             k_conv: matrix(kv_heads, head_dim)?,
@@ -1682,11 +1684,12 @@ impl DecodeAttention {
             DecodeAttentionKind::Full => 0,
         };
 
-        let q_flat = self.q.view().reshape(&[q_dim])?;
+        // Clipped out of place, so the clip can share a kernel with the key projection.
+        let q_flat = self.q_proj.view().reshape(&[q_dim])?;
         self.linear.record(scheme, weights.wq, q_hidden, q_flat)?;
         self.q_clip.record(
             scheme,
-            self.q.view(),
+            self.q_proj.view(),
             Some(weights.q_scale),
             step,
             self.q.view(),

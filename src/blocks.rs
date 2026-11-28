@@ -844,10 +844,6 @@ impl Blocks {
             )?
             .over_tensor(&k)
             .node();
-        // A full cache skips positions past its allocation, which a cyclic store would wrap.
-        if window == 0 {
-            return Ok(());
-        }
         let position = TensorView::new(
             step,
             TensorLayout::packed(TensorDType::U32, TensorShape::vector(1), 1)?,
@@ -855,8 +851,14 @@ impl Blocks {
         let keys = key_cache.permute(&[1, 2, 0])?;
         let values = value_cache.permute(&[1, 2, 0])?;
         self.tensors.recorder(scheme).describe(node, true, |rec| {
-            rec.cyclic_store_at("kv_store_key", k, keys, position)?;
-            rec.cyclic_store_at("kv_store_value", v, values, position)
+            // A full cache skips positions past its allocation, which a cyclic store would wrap.
+            if window == 0 {
+                rec.store_at("kv_store_key", k, keys, position)?;
+                rec.store_at("kv_store_value", v, values, position)
+            } else {
+                rec.cyclic_store_at("kv_store_key", k, keys, position)?;
+                rec.cyclic_store_at("kv_store_value", v, values, position)
+            }
         })
     }
 
@@ -1031,10 +1033,19 @@ impl Blocks {
         tape: TensorView<'_>,
         slot: u32,
     ) -> Result<(), GoldyError> {
-        self.depth_store
+        let node = self
+            .depth_store
             .record(scheme, "depth_store", src, tape, slot)?
-            .over_tensor(&src);
-        Ok(())
+            .over_tensor(&src)
+            .node();
+        // The kernel addresses both as packed rows.
+        if !src.is_contiguous() || !tape.is_contiguous() || slot >= tape.shape().dim(0)? {
+            return Ok(());
+        }
+        let row = tape.narrow(0, slot, 1)?.reshape(src.shape().dims())?;
+        self.tensors
+            .recorder(scheme)
+            .describe(node, true, |rec| rec.copy("depth_store", src, row))
     }
 
     pub(crate) fn record_depth_copy_rows(

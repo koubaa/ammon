@@ -228,7 +228,7 @@ fn run(spec: Spec, w: Weights<'_>, steps: &[Step<'_>]) {
 }
 
 /// The inference scheme against the reference. With `fusion`, the scheme settles on
-/// the first step, and the key clip and a ring cache store run inside fused regions.
+/// the first step, and the key clip and the cache store run inside fused regions.
 fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: bool) {
     let device = runtime();
     let ctx = device.create_context().unwrap();
@@ -268,14 +268,26 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        assert!(fused("l2_clip"), "no fused clip: {report:?}");
+        // Every clip without a log scale: query, key and relative on a sliding layer.
+        let logged = spec.log.is_some_and(|log| log.alpha != 0.0);
+        let clips: usize = report
+            .regions
+            .iter()
+            .filter(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted))
+            .map(|region| {
+                region
+                    .labels
+                    .iter()
+                    .filter(|label| label.to_string() == "l2_clip")
+                    .count()
+            })
+            .sum();
+        assert_eq!(clips, if logged { 1 } else { 3 }, "fused clips: {report:?}");
         assert!(
             fused("relative_attention_combine"),
             "no fused combine: {report:?}"
         );
-        if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
-            assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
-        }
+        assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
     }
     let stats = recorded.replay_stats();
     assert_eq!(
@@ -781,6 +793,16 @@ fn full_cache_replay_past_capacity(fusion: bool) {
                         .any(|label| label.to_string() == "relative_attention_combine")
             }),
             "no fused combine: {report:?}"
+        );
+        assert!(
+            report.regions.iter().any(|region| {
+                matches!(region.status, goldy::FusionRegionStatus::Promoted)
+                    && region
+                        .labels
+                        .iter()
+                        .any(|label| label.to_string() == "kv_cache_store")
+            }),
+            "no fused cache store: {report:?}"
         );
     }
     let mut read = Scheme::new(&ctx);
