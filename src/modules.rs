@@ -3,8 +3,8 @@
 //! submit schemes or bind exchanges.
 
 use crate::blocks::{
-    attention_splits, AttentionSites, Blocks, ClipScratch, ConvScratch, DynamicConvScratch,
-    FfnSites, NormScratch, SoftcapScratch, SwiGluScratch,
+    attention_splits, AttentionSites, Blocks, ClipScratch, CombineScratch, ConvScratch,
+    DynamicConvScratch, FfnSites, NormScratch, SoftcapScratch, SwiGluScratch,
 };
 use goldy::{
     Buffer, GoldyError, Runtime, Scheme, SchemeLabel, Tensor, TensorDType, TensorShape, TensorView,
@@ -251,6 +251,55 @@ impl ClipBuffers {
             scaled: self.scaled.view(),
             square: self.square.view(),
             factor: self.factor.view(),
+        }
+    }
+}
+
+/// Scratch of the split-attention combine over `[q_heads, splits, head_dim + 2]`.
+struct CombineBuffers {
+    shift: Tensor,
+    weighted: Tensor,
+    scaled: Tensor,
+    numer: Tensor,
+    top: Tensor,
+    denom: Tensor,
+    sink_weight: Tensor,
+}
+
+impl CombineBuffers {
+    fn new(
+        runtime: &Runtime,
+        q_heads: u32,
+        splits: u32,
+        head_dim: u32,
+    ) -> Result<Self, GoldyError> {
+        let zeros = |rows, len| {
+            Tensor::zeros(
+                runtime,
+                TensorShape::from_dims(&[q_heads, rows, len])?,
+                TensorDType::F32,
+            )
+        };
+        Ok(Self {
+            shift: zeros(splits, 1)?,
+            weighted: zeros(splits, 1)?,
+            scaled: zeros(splits, head_dim)?,
+            numer: zeros(1, head_dim)?,
+            top: zeros(1, 1)?,
+            denom: zeros(1, 1)?,
+            sink_weight: zeros(1, 1)?,
+        })
+    }
+
+    fn sites(&self) -> CombineScratch<'_> {
+        CombineScratch {
+            shift: self.shift.view(),
+            weighted: self.weighted.view(),
+            scaled: self.scaled.view(),
+            numer: self.numer.view(),
+            top: self.top.view(),
+            denom: self.denom.view(),
+            sink_weight: self.sink_weight.view(),
         }
     }
 }
@@ -1246,6 +1295,7 @@ pub struct DecodeLayerState {
     k_conv: Tensor,
     v_conv: Tensor,
     partial: Tensor,
+    combine: CombineBuffers,
     kernel: u32,
     /// Post-attention and post-MLP conv rings. Present after [`Self::with_post_conv`].
     ///
@@ -1315,6 +1365,7 @@ impl DecodeLayerState {
                 TensorShape::from_dims(&[q_heads, splits, kv.head_dim + 2])?,
                 f,
             )?,
+            combine: CombineBuffers::new(runtime, q_heads, splits, kv.head_dim)?,
             kv,
             kernel,
             post_attn: None,
@@ -1727,6 +1778,7 @@ impl DecodeAttention {
             step,
             window,
             cache.capacity,
+            state.combine.sites(),
         )?;
 
         let attn_flat = self.attn.view().reshape(&[q_dim])?;
