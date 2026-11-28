@@ -99,7 +99,6 @@ jobs:
       AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
       GOLDY_MATMUL_GEMV: library
       GOLDY_API_LOG: /tmp/goldy-api.ndjson
-      GOLDY_API_LOG_SYNC: "1"
       MTL_DEBUG_LAYER: "1"
       MTL_SHADER_VALIDATION: "1"
     steps:
