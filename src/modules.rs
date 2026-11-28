@@ -234,6 +234,7 @@ struct ClipBuffers {
     scaled: Tensor,
     square: Tensor,
     factor: Tensor,
+    log_factor: Tensor,
 }
 
 impl ClipBuffers {
@@ -243,6 +244,7 @@ impl ClipBuffers {
             scaled: Tensor::zeros(runtime, TensorShape::matrix(heads, dim), f)?,
             square: Tensor::zeros(runtime, TensorShape::matrix(heads, dim), f)?,
             factor: Tensor::zeros(runtime, TensorShape::matrix(heads, 1), f)?,
+            log_factor: Tensor::zeros(runtime, TensorShape::vector(1), f)?,
         })
     }
 
@@ -251,6 +253,7 @@ impl ClipBuffers {
             scaled: self.scaled.view(),
             square: self.square.view(),
             factor: self.factor.view(),
+            log_factor: self.log_factor.view(),
         }
     }
 }
@@ -713,8 +716,7 @@ pub struct HeadL2Clip {
     log: Option<LogPositionScale>,
     heads: u32,
     dim: u32,
-    /// `None` with a log scale, which no tensor operation states.
-    scratch: Option<ClipBuffers>,
+    scratch: ClipBuffers,
 }
 
 impl HeadL2Clip {
@@ -745,16 +747,13 @@ impl HeadL2Clip {
         if heads == 0 || dim == 0 {
             anyhow::bail!("l2 clip needs a positive head count and width");
         }
-        let logged = log.is_some_and(|log| log.alpha != 0.0);
         Ok(Self {
             blocks: blocks(runtime)?,
             threshold,
             log,
             heads,
             dim,
-            scratch: (!logged)
-                .then(|| ClipBuffers::new(runtime, heads, dim))
-                .transpose()?,
+            scratch: ClipBuffers::new(runtime, heads, dim)?,
         })
     }
 
@@ -803,7 +802,7 @@ impl HeadL2Clip {
             alpha,
             floor,
             use_scale,
-            self.scratch.as_ref().map(ClipBuffers::sites),
+            self.scratch.sites(),
         )
     }
 }

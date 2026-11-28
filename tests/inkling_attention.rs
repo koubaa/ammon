@@ -268,7 +268,20 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        assert!(fused("l2_clip"), "no fused clip: {report:?}");
+        // The key and relative clips, log-scaled or not. The query clip writes in place.
+        let clips: usize = report
+            .regions
+            .iter()
+            .filter(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted))
+            .map(|region| {
+                region
+                    .labels
+                    .iter()
+                    .filter(|label| label.to_string() == "l2_clip")
+                    .count()
+            })
+            .sum();
+        assert_eq!(clips, 2, "fused clips: {report:?}");
         assert!(
             fused("relative_attention_combine"),
             "no fused combine: {report:?}"
