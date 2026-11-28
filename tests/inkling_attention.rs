@@ -270,10 +270,18 @@ fn matches_reference(spec: &Spec, w: &Weights<'_>, steps: &[Step<'_>], fusion: b
                     && region.labels.iter().any(|label| label.to_string() == name)
             })
         };
-        // Both describe reassociated sums, so they fuse only under relaxed arithmetic.
-        let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
-        for name in ["l2_clip", "relative_attention_combine"] {
-            assert_eq!(fused(name), relaxed, "{name} fused: {report:?}");
+        if inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed {
+            assert!(fused("l2_clip"), "no fused clip: {report:?}");
+            assert!(
+                fused("relative_attention_combine"),
+                "no fused combine: {report:?}"
+            );
+        } else {
+            assert!(!fused("l2_clip"), "strict policy fused clip: {report:?}");
+            assert!(
+                !fused("relative_attention_combine"),
+                "strict policy fused combine: {report:?}"
+            );
         }
         if matches!(spec.kind, DecodeAttentionKind::Sliding { .. }) {
             assert!(fused("kv_cache_store"), "no fused cache store: {report:?}");
@@ -781,8 +789,11 @@ fn full_cache_replay_past_capacity(fusion: bool) {
                     .iter()
                     .any(|label| label.to_string() == "relative_attention_combine")
         });
-        let relaxed = inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed;
-        assert_eq!(combined, relaxed, "combine fused: {report:?}");
+        if inference_arithmetic_policy().unwrap() == ArithmeticPolicy::Relaxed {
+            assert!(combined, "no fused combine: {report:?}");
+        } else {
+            assert!(!combined, "strict policy fused combine: {report:?}");
+        }
     }
     let mut read = Scheme::new(&ctx);
     let after_zero = read_f32(&mut read, cache.keys().buffer());
