@@ -98,6 +98,8 @@ jobs:
     env:
       AMMON_ARITHMETIC_POLICY: ${{ matrix.arithmetic }}
       GOLDY_MATMUL_GEMV: library
+      GOLDY_API_LOG: /tmp/goldy-api.ndjson
+      GOLDY_API_LOG_SYNC: "1"
       MTL_DEBUG_LAYER: "1"
       MTL_SHADER_VALIDATION: "1"
     steps:
@@ -146,4 +148,10 @@ jobs:
         working-directory: ammon
         env:
           DYLD_LIBRARY_PATH: ${{ env.SLANG_LIB_DIR }}
-        run: cargo test --features metal -- --test-threads=1
+        run: |
+          set +e
+          cargo test --features metal --test decode_ops wide_clip_and_conv_match_reference \
+            -- --exact --nocapture --test-threads=1
+          status=$?
+          grep -E '"op":"(encoder_open|encoder_end|resource_barrier|dispatch)"' /tmp/goldy-api.ndjson || true
+          exit "$status"
